@@ -1,0 +1,66 @@
+# ── Build output ──────────────────────────────────────────────────────────────
+# STM32CubeIDE writes one directory per build configuration.
+/Debug/
+/Release/
+
+# Object files, dependency files and the per-function stack/cyclomatic reports
+# GCC emits alongside them.
+*.o
+*.d
+*.su
+*.cyclo
+
+# Linked images and their listings. The .elf is what gets flashed; it is a build
+# product, not a source.
+*.elf
+*.bin
+*.hex
+*.srec
+*.map
+*.list
+*.lst
+
+# ── STM32CubeIDE / CubeMX scratch ─────────────────────────────────────────────
+# .mxproject is CubeMX's record of what it generated last time. It is derived
+# from the .ioc and is rewritten on every generate.
+.mxproject
+MXTmpFiles/
+*.ioc_bak
+
+# Eclipse workspace leftovers. These appear when a project is opened, not when
+# it is written, so they belong to whoever opened it.
+.metadata/
+RemoteSystemsTempFiles/
+*.launch
+*.bak
+*~
+
+# ── Editors and OS ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Deliberately NOT ignored - each of these is commonly excluded by copy-pasted
+# STM32 gitignores, and every one of them would break a fresh clone here:
+#
+#   .project .cproject .settings/
+#       These *are* the CubeIDE project. Without them a clone is a folder of C
+#       files with no build configuration - no include paths, no -D defines, no
+#       linker script, no toolchain. There is no .ioc to regenerate them from,
+#       because this is a bare CMSIS project (see README).
+#
+#   Drivers/
+#       Vendor CMSIS headers, but not optional and not fetched by any package
+#       manager: without them nothing compiles. Trimmed to the five headers a
+#       Cortex-M0+ GCC build actually reaches, so it costs ~676 KB rather than
+#       the 3.4 MB the full CMSIS drop would.
+#
+#   Startup/startup_stm32c011f6ux.s, STM32C011F6UX_FLASH.ld
+#       Part-specific and hand-placed. Nothing regenerates them.
+#
+#   Src/main.c
+#       Ours, not generated. A CubeMX-flavoured gitignore would exclude it.
+# ══════════════════════════════════════════════════════════════════════════════
