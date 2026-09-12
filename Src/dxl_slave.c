@@ -1,21 +1,31 @@
 /**
  * @file    dxl_slave.c
- * @brief   Dynamixel Protocol 2.0 slave over USART1 single-wire half-duplex.
+ * @brief   Dynamixel Protocol 2.0 slave over USART1, half-duplex.
  *
- * ## Sharing one wire with no transceiver
+ * ## Owning one shared wire
  *
- * DATA_TX runs from PB6 straight to the JST connectors: no 74LVC bus buffer, no
- * direction pin. PB6 is USART1_TX and USART1_RX cannot be routed to it, so the
- * only way to receive is HDSEL - single-wire half-duplex, where the USART feeds
- * its receiver from the TX pin.
+ * Sixteen devices share DATA and take turns. The protocol layer here is the
+ * same on every board revision; what differs is how this MCU lets go of the
+ * wire when it is not its turn, and that lives in line_drive() / line_release()
+ * behind DXL_BUFFERED from board.h.
  *
- * HDSEL alone is not enough. With TE set the transmitter idles the pin high,
- * which on a shared bus would fight every servo that tries to answer. The fix
- * is the output type: the pin sits in alternate-function **open-drain** while
- * receiving, so an idle-high transmitter releases it, and flips to push-pull
- * for the few hundred microseconds it takes to send a status packet. Open-drain
- * the whole time would be simpler, but at 1 Mbps the rise time through the
- * bus pull-up alone is far too slow.
+ * **Rev 1, DXL_BUFFERED = 0.** PB6 runs straight to the connector, and
+ * USART1_RX cannot be routed to it, so USART1 runs single-wire half-duplex
+ * (HDSEL), feeding its receiver from the TX pin. HDSEL alone would idle the pin
+ * high and fight every servo; the fix is the output type. PB6 sits in
+ * alternate-function **open-drain** while receiving, so an idle-high
+ * transmitter releases it, and flips to push-pull for the few hundred
+ * microseconds it takes to send. Open-drain the whole time would be simpler,
+ * but at 1 Mbps the rise time through the bus pull-up alone is far too slow.
+ *
+ * **Rev 2, DXL_BUFFERED = 1.** A 74LVC1G125 sits between PB6 and the bus, and
+ * the bus comes back to PB7 as a normal USART1_RX. Its OE# is driven by
+ * USART1's own driver-enable output on PA12: with DEM set, the USART asserts DE
+ * before every start bit and drops it after the last stop bit, timed in
+ * sixteenths of a bit by DEAT/DEDT. The firmware never touches the line and
+ * line_drive() / line_release() are empty. Because PB7 is on the bus,
+ * everything this board transmits is also received - RE is dropped for the
+ * duration of a transmission, exactly as HDSEL requires on Rev 1.
  *
  * ## Latency
  *
@@ -162,21 +172,37 @@ static uint16_t dxl_crc(const uint8_t *data, uint16_t len)
 
 /* -- line direction ------------------------------------------------------- */
 
+/*
+ * These two are the only place the board revision reaches into the protocol.
+ * Both must be fast and both must be safe to call from the ISR.
+ */
+
+#if DXL_BUFFERED
+
+/* Hardware DE owns the buffer. Nothing to do, on purpose - these stay so the
+ * transmit path reads the same on both revisions. */
+static inline void line_release(void) { }
+static inline void line_drive(void)   { }
+
+#else
+
 static inline void line_release(void)
 {
-    DXL_PORT->OTYPER |= DXL_PIN; /* open-drain: an idle-high TX lets go */
+    DXL_PORT->OTYPER |= DXL_TX_PIN; /* open-drain: an idle-high TX lets go */
 }
 
 static inline void line_drive(void)
 {
-    DXL_PORT->OTYPER &= ~DXL_PIN; /* push-pull: real edges at 1 Mbps */
+    DXL_PORT->OTYPER &= ~DXL_TX_PIN; /* push-pull: real edges at 1 Mbps */
 }
+
+#endif
 
 /* -- transmit ------------------------------------------------------------- */
 
 static void tx_start(void)
 {
-    USART1->CR1 &= ~USART_CR1_RE; /* HDSEL would otherwise echo us back */
+    USART1->CR1 &= ~USART_CR1_RE; /* the receiver is on the same wire */
     line_drive();
     s_tx_pos = 0u;
     USART1->ICR = USART_ICR_TCCF;
@@ -494,17 +520,73 @@ void USART1_IRQHandler(void)
 
 /* -- public --------------------------------------------------------------- */
 
-static void dxl_gpio_init(void)
+/*
+ * GPIO comes up in two steps around the USART, not one before it.
+ *
+ * dxl_gpio_prepare() sets everything about the pins except their mode - AF
+ * number, pull, speed, output type - while they are still the high-impedance
+ * inputs reset left them as. dxl_gpio_connect() then switches them to
+ * alternate function, and is only called once USART1 is clocked, configured
+ * and enabled. Put into AF mode earlier, a pin is driven by a peripheral that
+ * does not exist yet, and the level it gets is whatever the unclocked mux
+ * happens to output - low, in practice. On Rev 2 that is OE# low: U5 enabled,
+ * the bus driven from an idle PB6 until the USART wakes up. On Rev 1 it is an
+ * open-drain PB6 pulled low. Either is a glitch on a wire fifteen servos are
+ * listening to, at exactly the moment they are booting too.
+ *
+ * Until connect(), R7 holds OE# high through PA12's high impedance and the bus
+ * pull-up holds DATA high through PB6's, so the board is silent by default.
+ */
+
+static void dxl_gpio_prepare(void)
 {
     RCC->IOPENR |= RCC_IOPENR_GPIOBEN;
 
-    DXL_PORT->AFR[0] = (DXL_PORT->AFR[0] & ~(0xFu << (DXL_PIN_NUM * 4)))
-                     | ((uint32_t)DXL_PIN_AF << (DXL_PIN_NUM * 4));
-    DXL_PORT->OTYPER |= DXL_PIN; /* released until there is something to say */
-    DXL_PORT->OSPEEDR |= (3u << (DXL_PIN_NUM * 2));
-    DXL_PORT->PUPDR &= ~(3u << (DXL_PIN_NUM * 2));
-    DXL_PORT->MODER = (DXL_PORT->MODER & ~(3u << (DXL_PIN_NUM * 2)))
-                    | (2u << (DXL_PIN_NUM * 2));
+    DXL_PORT->AFR[0] = (DXL_PORT->AFR[0] & ~(0xFu << (DXL_TX_PIN_NUM * 4)))
+                     | ((uint32_t)DXL_TX_AF << (DXL_TX_PIN_NUM * 4));
+    DXL_PORT->OSPEEDR |= (3u << (DXL_TX_PIN_NUM * 2));
+    DXL_PORT->PUPDR &= ~(3u << (DXL_TX_PIN_NUM * 2));
+
+#if DXL_BUFFERED
+    /* PB6 only ever drives U5's input: ordinary push-pull. */
+    DXL_PORT->OTYPER &= ~DXL_TX_PIN;
+
+    /* PB7 reads the bus. The pull-up is deliberate: with U5 released and every
+     * servo silent, nothing else on this board defines the idle level, and a
+     * floating CMOS input under a UART receiver is framing errors. ~40k is
+     * weak enough never to fight a driver. */
+    DXL_PORT->AFR[0] = (DXL_PORT->AFR[0] & ~(0xFu << (DXL_RX_PIN_NUM * 4)))
+                     | ((uint32_t)DXL_RX_AF << (DXL_RX_PIN_NUM * 4));
+    DXL_PORT->PUPDR = (DXL_PORT->PUPDR & ~(3u << (DXL_RX_PIN_NUM * 2)))
+                    | (1u << (DXL_RX_PIN_NUM * 2));
+    DXL_PORT->MODER = (DXL_PORT->MODER & ~(3u << (DXL_RX_PIN_NUM * 2)))
+                    | (2u << (DXL_RX_PIN_NUM * 2));
+
+    /* PA12 as USART1_DE - AF number now, AF mode in connect(). Belt and
+     * braces: ODR is set high as well, so if anything ever does put this pin
+     * into plain output mode it releases U5 rather than enabling it. */
+    RCC->IOPENR |= RCC_IOPENR_GPIOAEN;
+    DXL_DE_PORT->BSRR = DXL_DE_PIN;
+    DXL_DE_PORT->AFR[DXL_DE_PIN_NUM / 8u] =
+        (DXL_DE_PORT->AFR[DXL_DE_PIN_NUM / 8u] & ~(0xFu << ((DXL_DE_PIN_NUM % 8u) * 4u)))
+        | ((uint32_t)DXL_DE_AF << ((DXL_DE_PIN_NUM % 8u) * 4u));
+    DXL_DE_PORT->OSPEEDR |= (3u << (DXL_DE_PIN_NUM * 2));
+#else
+    DXL_PORT->OTYPER |= DXL_TX_PIN; /* released until there is something to say */
+#endif
+}
+
+static void dxl_gpio_connect(void)
+{
+#if DXL_BUFFERED
+    /* DE first, then TX. With DEM|DEP already set and the transmitter idle,
+     * the USART is holding DE inactive-high, so OE# goes from R7-high to
+     * driven-high and U5 never sees an edge. */
+    DXL_DE_PORT->MODER = (DXL_DE_PORT->MODER & ~(3u << (DXL_DE_PIN_NUM * 2)))
+                       | (2u << (DXL_DE_PIN_NUM * 2));
+#endif
+    DXL_PORT->MODER = (DXL_PORT->MODER & ~(3u << (DXL_TX_PIN_NUM * 2)))
+                    | (2u << (DXL_TX_PIN_NUM * 2));
 }
 
 void dxl_slave_init(void)
@@ -520,19 +602,33 @@ void dxl_slave_init(void)
     s_state = S_FF1;
 
     us_timer_init();
-    dxl_gpio_init();
+    dxl_gpio_prepare();
 
     RCC->APBENR2 |= RCC_APBENR2_USART1EN;
 
     USART1->CR1 = 0u;
     USART1->BRR = (uint16_t)((SystemCoreClock + (DXL_BAUD / 2u)) / DXL_BAUD);
     USART1->CR2 = 0u;
-    /* HDSEL wires the receiver to the TX pin. OVRDIS keeps a byte lost during a
-     * transmission from latching an overrun the parser would then have to clear
-     * before it could resynchronise. */
+    /* OVRDIS keeps a byte lost during a transmission from latching an overrun
+     * the parser would then have to clear before it could resynchronise. */
+#if DXL_BUFFERED
+    /* DEM: the USART drives DE around each transmission. DEP: active low, to
+     * match U5's OE#. DEAT/DEDT: assert 4/16 of a bit before the start bit and
+     * hold 4/16 after the stop bit - 250 ns each at 1 Mbps, which is fifty
+     * times U5's enable time and invisible next to the 10 us byte. */
+    USART1->CR3 = USART_CR3_DEM | USART_CR3_DEP | USART_CR3_OVRDIS;
+    USART1->CR1 = (4u << USART_CR1_DEAT_Pos) | (4u << USART_CR1_DEDT_Pos);
+#else
+    /* HDSEL wires the receiver to the TX pin - the only way to receive on a
+     * board where USART1_RX has nowhere to go. */
     USART1->CR3 = USART_CR3_HDSEL | USART_CR3_OVRDIS;
-    USART1->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE_RXFNEIE;
+#endif
+    USART1->CR1 |= USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE_RXFNEIE;
     USART1->CR1 |= USART_CR1_UE;
+
+    /* Only now, with TX idling high and DE idling inactive, do the pins join
+     * the peripheral. */
+    dxl_gpio_connect();
 
     NVIC_SetPriority(USART1_IRQn, 0u);
     NVIC_EnableIRQ(USART1_IRQn);

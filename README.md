@@ -87,32 +87,85 @@ never on ID 200, so this board does not have to emulate the XL330 control table.
 
 ---
 
-## Pin assignment (from `docs/schematic.pdf`)
+## Pin assignment
 
-STM32C011F6U6TR, UFQFPN20. Source: `docs/schematic.pdf`.
+Two board revisions exist. `BOARD_REV` in `Inc/board.h` selects one (default
+**2**); `-DBOARD_REV=1` in the build settings overrides it. Nothing in the `.c`
+files names a pin directly — every pin goes through `board.h`.
+
+### Rev 2 — buffered bus (`hardware-bdx/microduck-imu/1.1`, schematic 2026-09-12)
+
+STM32C011F6U6TR (U1), UFQFPN20.
 
 | Pin | Port | Net | Function |
 |---|---|---|---|
-| 2 | VDD/VDDA | +3.3V | AP2210K LDO, VIN 3.5–13.2 V |
+| 2 | VDD/VDDA | +3.3V | AP2210K LDO, fed from the MP2225 5 V buck (VIN on J2) |
 | 3 | VSS/VSSA | GND | |
 | 4 | PF2/NRST | RESET | 10 k pull-up + 100 nF, TC2030 pin 3 |
-| 5 | **PA0** | IMU_INT | ← LSM6DSV16X INT1 (pin 4) |
 | 9 | **PA4** | SPI_CS | → IMU CS (pin 12), 10 k pull-up — software NSS |
 | 10 | **PA5** | SPI_SCK | → IMU SCL/SCK (pin 13), AF0 = SPI1_SCK |
 | 11 | **PA6** | SPI_MISO | ← IMU SDO/SA0 (pin 1), AF0 = SPI1_MISO |
 | 12 | **PA7** | SPI_MOSI | → IMU SDA/SDI (pin 14), AF0 = SPI1_MOSI |
-| 13 | **PA8** | LED | D2 anode on +3.3V through R2 1 k — **LOW = lit** |
+| 13 | **PA8** | IMU_INT | ← LSM6DSV16X INT1 (pin 4) |
+| 14 | **PA11** | LED | D2 anode on +3.3V through R9 1 k — **LOW = lit**. AF2 = TIM1_CH4 |
+| 15 | **PA12** | DXL_DIR | → U5 OE#, R7 10 k pull-up. AF1 = USART1_DE |
 | 16 | PA13 | SWDIO | TC2030 pin 2 |
 | 17 | PA14/BOOT0 | SWCLK | TC2030 pin 4, 10 k pull-down on BOOT0 |
-| 18 | **PB6** | DATA_TX | Dynamixel data, J2/J3 pin 3, AF0 = USART1_TX |
+| 18 | **PB6** | USART1_TX | → U5 A. AF0 = USART1_TX |
+| 19 | **PB7** | DXL_DATA | ← U5 Y and J1/J4/J5 pin 3. AF0 = USART1_RX |
+
+Unconnected: PA0–PA3, PC14, PC15. Pins 14 and 15 are PA11/PA12 by default and
+become PA9/PA10 only if `SYSCFG_CFGR1.PA11_RMP` / `PA12_RMP` are set; the
+firmware never sets them, and must not — the default mapping is the one that
+carries `TIM1_CH4` and `USART1_DE`.
+
+J1, J4 and J5 are identical 3-pin 2.0 mm (GND, +5V, DXL_DATA) for
+daisy-chaining. J2 is the 2-pin VIN input.
+
+#### How the bus is shared on Rev 2
+
+U5, an **SN74LVC1G125** single-gate buffer, is the transmit/receive switch:
+
+```
+PB6 USART1_TX ──► A   Y ──┬── DXL_DATA ── J1/J4/J5
+PA12 DXL_DIR  ──► OE#     └── PB7 USART1_RX
+                  (R7 10 k pull-up)
+```
+
+* **Receive:** OE# high, Y is high-impedance, the bus belongs to whoever is
+  talking, and PB7 reads it as an ordinary `USART1_RX`. R7 guarantees this
+  state from power-on until the firmware says otherwise, and until then every
+  MCU pin is high-impedance.
+* **Transmit:** OE# low for exactly the duration of the status packet, and Y
+  drives the bus from PB6.
+
+DXL_DIR is not toggled by software. PA12 is `USART1_DE`, the USART's own
+driver-enable output: with `CR3.DEM` set it asserts DE ahead of every start bit
+and releases it after the last stop bit, timed in sixteenths of a bit by
+`DEAT`/`DEDT` (4/16, i.e. 250 ns at 1 Mbps). `CR3.DEP` inverts it to match the
+active-low OE#. The firmware therefore cannot release the bus late, or early.
+
+Because PB7 sits on the bus, everything this board transmits comes straight
+back into its own receiver. `RE` is cleared for the duration of a transmission
+and the RX register is flushed at `TC`, so our own status packets never reach
+the parser.
+
+PB6 and PA12 are switched into alternate-function mode **only after** USART1
+is clocked, configured and enabled. Put into AF earlier, the pins would be
+driven by an unclocked peripheral and could pull OE# low — U5 enabled, the bus
+driven — for the few microseconds until the USART wakes up.
+
+### Rev 1 — direct bus (schematic 2026-09-05)
+
+| Pin | Port | Net | Function |
+|---|---|---|---|
+| 5 | **PA0** | IMU_INT | ← LSM6DSV16X INT1 (pin 4) |
+| 9–12 | PA4–PA7 | SPI | as Rev 2 |
+| 13 | **PA8** | LED | D2 anode on +3.3V through R2 1 k — **LOW = lit**. AF13 = TIM14_CH1 |
+| 16, 17 | PA13, PA14 | SWD | as Rev 2 |
+| 18 | **PB6** | DATA_TX | Dynamixel data, J2/J3 pin 3, **direct** |
 
 Unconnected: PA1, PA2, PA3, PA9/PA11, PA10/PA12, PB7, PC14, PC15.
-On the IMU, SDx and SCx are tied to GND, and INT2 / OCS_AUX / SDO_AUX are open —
-plain 4-wire SPI with no OIS chain.
-
-J2 and J3 are identical 3-pin JST EH (GND, VIN, DATA_TX) for daisy-chaining.
-
-### The one non-obvious thing about the bus pin
 
 DATA_TX runs from PB6 straight to the connectors — **no bus transceiver, no
 direction pin**. PB6 is `USART1_TX`; `USART1_RX` cannot be routed to it. So:
@@ -125,8 +178,8 @@ direction pin**. PB6 is `USART1_TX`; `USART1_RX` cannot be routed to it. So:
   ~230 µs it takes to send a status packet. Open-drain throughout would be
   simpler, but at 1 Mbps the pull-up alone cannot make the rising edges.
 
-`RE` is cleared during transmission so HDSEL does not echo our own bytes back
-into the parser.
+On both revisions the IMU's SDx and SCx are tied to GND, and INT2 / OCS_AUX /
+SDO_AUX are open — plain 4-wire SPI with no OIS chain.
 
 ### Clock — and the absence of a crystal
 
@@ -196,10 +249,10 @@ whose peripherals are all configured by hand it costs little.
 
 | File | What it does |
 |---|---|
-| `Inc/board.h` | pin map, transcribed from the schematic |
+| `Inc/board.h` | pin map per board revision, transcribed from the schematics; `BOARD_REV` lives here |
 | `Src/main.c` | clock, SysTick, main loop |
 | `Src/lsm6dsv16x.c` | SPI1 at register level; chip config; FIFO drain for SFLP |
-| `Src/dxl_slave.c` | Protocol 2.0 slave, USART1 half-duplex, all in the ISR |
+| `Src/dxl_slave.c` | Protocol 2.0 slave on USART1, all in the ISR; hardware DE (Rev 2) or HDSEL + open-drain (Rev 1) |
 | `Src/app.c` | poll loop, sensor block assembly, LED |
 
 From the CubeIDE template and not worth reading: `Src/syscalls.c`,
@@ -312,15 +365,20 @@ Verified **on hardware** (STLINK-V3MINIE over SWD, target at 3.27 V, device ID
 * SFLP quaternion non-zero and normalised, w = 0.99964, about 3 degrees off
   level - consistent with a board lying on a desk.
 
-Still unverified: **the Dynamixel bus itself.** `dxl_slave_replies()` reads 0
-because nothing is polling - that needs the robot or a U2D2 on J2/J3. Everything
-upstream of the connector is now proven.
+All of the above was measured on a **Rev 1** board. Still unverified: **the
+Dynamixel bus itself**, on either revision. `dxl_slave_replies()` reads 0
+because nothing is polling - that needs the robot or a U2D2 on the bus
+connector. Everything upstream of the connector is proven on Rev 1; Rev 2 has
+so far only been built (`-Wall -Wextra` clean, 3 872 bytes at `-Os`) and needs
+the same bring-up pass - in particular that PA12 goes low around each status
+packet and nowhere else.
 
 ### LED
 
-D2's anode sits on +3.3 V through R2, so PA8 **sinks** - low is lit. The pin is
-driven as PWM by **TIM14_CH1 (AF13)** at 999 Hz with 1000 duty steps, which is
-what lets the healthy pattern fade instead of switch.
+D2's anode sits on +3.3 V through a 1 k resistor, so the LED pin **sinks** - low
+is lit. The pin is driven as PWM at 999 Hz with 1000 duty steps, which is what
+lets the healthy pattern fade instead of switch: **TIM1_CH4 (AF2) on PA11** on
+Rev 2, **TIM14_CH1 (AF13) on PA8** on Rev 1.
 
 | state | pattern |
 |---|---|
@@ -333,11 +391,13 @@ be timed.
 
 Three details that matter more than they look:
 
-* **TIM14, not TIM3.** TIM3 is the microsecond clock the Dynamixel slave times
-  its turnaround with, fixed at `ARR = 0xFFFF`; as a PWM period that is 15 Hz,
-  i.e. visible flicker. TIM14 is otherwise unused and, unlike TIM1, needs no
-  `BDTR.MOE` to drive its output.
-* **`CC1P` inverts the channel**, so `CCR1` reads as brightness rather than as
+* **Not TIM3.** TIM3 is the microsecond clock the Dynamixel slave times its
+  turnaround with, fixed at `ARR = 0xFFFF`; as a PWM period that is 15 Hz,
+  i.e. visible flicker. On Rev 2 the LED pin only reaches TIM1, and TIM1 is an
+  advanced timer: its outputs stay off until `BDTR.MOE` is set
+  (`LED_TIM_HAS_MOE` in `board.h`). Forgetting that is silent - the timer
+  counts, CCR updates, the pin never moves.
+* **`CCxP` inverts the channel**, so `CCRx` reads as brightness rather than as
   darkness on a pin that sinks.
 * **Duty is the square of the level.** The eye is not linear; a linear ramp
   spends most of its travel in a range that already looks fully lit, and reads

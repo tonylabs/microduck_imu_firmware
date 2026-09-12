@@ -60,7 +60,9 @@
 #define DXL_STATUS_SPI_ERROR    0x08u /* an SPI transfer timed out           */
 
 /**
- * Bring USART1 up in single-wire half-duplex on PB6 and start serving.
+ * Bring USART1 up on the bus and start serving. How the line is shared is the
+ * board's business - see DXL_BUFFERED in board.h and line_drive() in
+ * dxl_slave.c.
  *
  * From here the slave runs entirely out of the USART1 interrupt; there is no
  * poll function to call.

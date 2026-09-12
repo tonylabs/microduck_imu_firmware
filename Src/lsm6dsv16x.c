@@ -93,7 +93,7 @@ static void spi_gpio_init(void)
 
     /* INT1 in. Wired, and deliberately not used to pace the loop yet - see
      * app.c for why the poll is free-running. */
-    IMU_INT_PORT->MODER &= ~(3u << (0 * 2));
+    IMU_INT_PORT->MODER &= ~(3u << (IMU_INT_PIN_NUM * 2));
 }
 
 static void spi_periph_init(void)

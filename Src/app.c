@@ -60,19 +60,41 @@ static uint32_t s_last_error_ms;
 static bool     s_fault_shown;
 
 /*
- * The LED is on TIM14_CH1 (PA8, AF13) as a ~1 kHz PWM, so the healthy pattern
- * can fade rather than switch.
+ * The LED is a ~1 kHz PWM on a timer channel, so the healthy pattern can fade
+ * rather than switch. Which timer and pin is the board's business - board.h
+ * names LED_TIM / LED_PIN_NUM / LED_AF per revision.
  *
- * TIM14 and not TIM3: TIM3 is the microsecond clock the Dynamixel slave times
- * its turnaround with, and it is fixed at ARR = 0xFFFF, which as a PWM period
- * would be 15 Hz - visible flicker. TIM14 is otherwise unused and, unlike TIM1,
- * needs no MOE to drive its output.
+ * Not TIM3, on any revision: TIM3 is the microsecond clock the Dynamixel slave
+ * times its turnaround with, and it is fixed at ARR = 0xFFFF, which as a PWM
+ * period would be 15 Hz - visible flicker.
  *
  * D2's anode sits on +3.3 V through R2, so the pin sinks: CC1P inverts the
  * channel, which lets CCR1 be read as brightness instead of as darkness.
  */
-#define LED_MAX     1000u /* = ARR, so PWM is 1 MHz / 1001 = 999 Hz */
-#define LED_PIN_AF    13u
+#define LED_MAX 1000u /* = ARR, so PWM is 1 MHz / 1001 = 999 Hz */
+
+/*
+ * Channel plumbing. Channels 1-2 live in CCMR1 and 3-4 in CCMR2, and every
+ * channel has its own enable/polarity pair in CCER and its own CCR. Resolved
+ * once here from LED_TIM_CH so the init below reads the same for any channel.
+ */
+#if LED_TIM_CH == 1
+#define LED_CCMR      CCMR1
+#define LED_OCM_POS   TIM_CCMR1_OC1M_Pos
+#define LED_OCPE      TIM_CCMR1_OC1PE
+#define LED_CCE       TIM_CCER_CC1E
+#define LED_CCP       TIM_CCER_CC1P
+#define LED_CCR       CCR1
+#elif LED_TIM_CH == 4
+#define LED_CCMR      CCMR2
+#define LED_OCM_POS   TIM_CCMR2_OC4M_Pos
+#define LED_OCPE      TIM_CCMR2_OC4PE
+#define LED_CCE       TIM_CCER_CC4E
+#define LED_CCP       TIM_CCER_CC4P
+#define LED_CCR       CCR4
+#else
+#error "LED_TIM_CH: only channels 1 and 4 are wired up here"
+#endif
 
 /**
  * Brightness 0..LED_MAX to duty.
@@ -88,30 +110,41 @@ static uint16_t led_duty(uint16_t level)
 
 static void led_level(uint16_t level)
 {
-    TIM14->CCR1 = led_duty(level);
+    LED_TIM->LED_CCR = led_duty(level);
 }
 
 static void led_init(void)
 {
     RCC->IOPENR |= RCC_IOPENR_GPIOAEN;
-    RCC->APBENR2 |= RCC_APBENR2_TIM14EN;
+    LED_TIM_RCC_EN();
 
     /* Park the pin high - dark - before the timer owns it, so nothing flashes
      * between reset and the first envelope update. */
     LED_PORT->BSRR = LED_PIN;
-    LED_PORT->MODER = (LED_PORT->MODER & ~(3u << (8 * 2))) | (1u << (8 * 2));
+    LED_PORT->MODER = (LED_PORT->MODER & ~(3u << (LED_PIN_NUM * 2)))
+                    | (1u << (LED_PIN_NUM * 2));
 
-    TIM14->PSC = (uint16_t)((SystemCoreClock / 1000000u) - 1u); /* 1 MHz tick */
-    TIM14->ARR = LED_MAX;
-    TIM14->CCR1 = 0u;
-    TIM14->CCMR1 = (6u << TIM_CCMR1_OC1M_Pos) | TIM_CCMR1_OC1PE; /* PWM mode 1 */
-    TIM14->CCER = TIM_CCER_CC1E | TIM_CCER_CC1P;                 /* active low  */
-    TIM14->CR1 = TIM_CR1_ARPE;
-    TIM14->EGR = TIM_EGR_UG;
-    TIM14->CR1 |= TIM_CR1_CEN;
+    LED_TIM->PSC = (uint16_t)((SystemCoreClock / 1000000u) - 1u); /* 1 MHz tick */
+    LED_TIM->ARR = LED_MAX;
+    LED_TIM->LED_CCR = 0u;
+    LED_TIM->LED_CCMR = (6u << LED_OCM_POS) | LED_OCPE; /* PWM mode 1, preload */
+    LED_TIM->CCER = LED_CCE | LED_CCP;                   /* enabled, active low  */
+#if LED_TIM_HAS_MOE
+    /* TIM1/TIM16/TIM17 gate every output behind the main output enable. Without
+     * this the timer counts, CCR1 updates, and the pin never moves - there is
+     * no error, just a dark LED. */
+    LED_TIM->BDTR = TIM_BDTR_MOE;
+#endif
+    LED_TIM->CR1 = TIM_CR1_ARPE;
+    LED_TIM->EGR = TIM_EGR_UG;
+    LED_TIM->CR1 |= TIM_CR1_CEN;
 
-    LED_PORT->AFR[1] = (LED_PORT->AFR[1] & ~0xFu) | LED_PIN_AF;
-    LED_PORT->MODER = (LED_PORT->MODER & ~(3u << (8 * 2))) | (2u << (8 * 2));
+    /* AFR[0] covers pins 0-7, AFR[1] pins 8-15. */
+    LED_PORT->AFR[LED_PIN_NUM / 8u] =
+        (LED_PORT->AFR[LED_PIN_NUM / 8u] & ~(0xFu << ((LED_PIN_NUM % 8u) * 4u)))
+        | ((uint32_t)LED_AF << ((LED_PIN_NUM % 8u) * 4u));
+    LED_PORT->MODER = (LED_PORT->MODER & ~(3u << (LED_PIN_NUM * 2)))
+                    | (2u << (LED_PIN_NUM * 2));
 }
 
 /** Linear interpolation over a segment of the heartbeat envelope. */
