@@ -27,17 +27,27 @@
 /*
  * LED, in two states.
  *
- *   healthy  the IMU answered WHO_AM_I: a faded lub-dub every five seconds
+ *   healthy  the IMU answered WHO_AM_I: breathes, continuously, two seconds a
+ *            breath, never quite dark
  *   fault    it did not, or an SPI transfer is failing: ~12 Hz, hard edges
  *
  * The two are deliberately unalike in kind and not just in rate - one breathes,
  * the other strobes - so which one you are looking at is obvious from across a
  * room and after a glance, rather than needing to be timed.
+ *
+ * It used to be a lub-dub every five seconds: two beats in 700 ms and then
+ * 4.3 s of dark, which from the bench reads as "blinked a few times and
+ * stopped" rather than as alive. A breath has no dark gap to misread.
  */
-#define HEARTBEAT_PERIOD_MS 5000u
-#define BLINK_FAULT_MS        40u
+#define BREATH_PERIOD_MS 2000u
+#define BLINK_FAULT_MS     40u
 
-/** Envelope update interval. 4 ms gives 35 steps across the first beat's rise,
+/** Where a breath bottoms out, 0..LED_MAX. Not zero: a moment of dark at the
+ *  end of every breath is the "stopped" the pattern exists to avoid. After
+ *  led_duty() squares it this is under 1 % duty - a glow, not a light. */
+#define BREATH_FLOOR 80u
+
+/** Envelope update interval. 4 ms gives 250 steps across a breath's rise,
  *  which is smooth to the eye, and costs one multiply and one divide per step
  *  on a loop that is idle 95 % of the time. */
 #define LED_STEP_MS 4u
@@ -147,7 +157,7 @@ static void led_init(void)
                     | (2u << (LED_PIN_NUM * 2));
 }
 
-/** Linear interpolation over a segment of the heartbeat envelope. */
+/** Linear interpolation over a segment of the LED envelope. */
 static uint16_t ramp(uint32_t t, uint32_t t0, uint32_t t1, uint32_t v0, uint32_t v1)
 {
     if (t <= t0) {
@@ -163,27 +173,18 @@ static uint16_t ramp(uint32_t t, uint32_t t0, uint32_t t1, uint32_t v0, uint32_t
 }
 
 /**
- * Two beats and a long pause - lub-dub - over HEARTBEAT_PERIOD_MS.
- *
- * The second beat is deliberately weaker and starts before the first has fully
- * decayed. An even pair reads as "blinking twice"; the asymmetry is what makes
- * it read as a pulse.
+ * One breath over BREATH_PERIOD_MS: a rise to full and a fall back to the
+ * floor, both linear in level. led_duty() squares the level, so in light this
+ * comes out as a slow start, a quick brighten and an easing-off at the top -
+ * near enough a sine that nobody times it - and the same in reverse.
  */
-static uint16_t heartbeat_level(uint32_t phase_ms)
+static uint16_t breath_level(uint32_t phase_ms)
 {
-    if (phase_ms < 140u) {
-        return ramp(phase_ms, 0u, 140u, 0u, LED_MAX);
+    const uint32_t half = BREATH_PERIOD_MS / 2u;
+    if (phase_ms < half) {
+        return ramp(phase_ms, 0u, half, BREATH_FLOOR, LED_MAX);
     }
-    if (phase_ms < 340u) {
-        return ramp(phase_ms, 140u, 340u, LED_MAX, 0u);
-    }
-    if (phase_ms < 440u) {
-        return ramp(phase_ms, 340u, 440u, 0u, 650u);
-    }
-    if (phase_ms < 700u) {
-        return ramp(phase_ms, 440u, 700u, 650u, 0u);
-    }
-    return 0u;
+    return ramp(phase_ms, half, BREATH_PERIOD_MS, LED_MAX, BREATH_FLOOR);
 }
 
 static void put_i16(uint8_t *dst, int16_t v)
@@ -228,9 +229,8 @@ void app_task(void)
     }
     bool fault = !s_imu_present || ((uint32_t)(now - s_last_error_ms) < FAULT_HOLD_MS);
 
-    /* Changing state re-arms the timer immediately. Without this, a fault that
-     * appeared during the four-and-a-bit second gap between heartbeats would
-     * not show on the LED until that gap had run out. */
+    /* Changing state re-arms the timer immediately, so a fault shows on the
+     * LED on the next pass rather than at the end of the current 4 ms step. */
     if (fault != s_fault_shown) {
         s_fault_shown = fault;
         s_next_blink = now;
@@ -245,9 +245,9 @@ void app_task(void)
             s_next_blink = now + BLINK_FAULT_MS;
         } else {
             /* Free-running phase off the millisecond clock. It needs no state
-             * of its own; the cost is one shortened beat when board_millis()
+             * of its own; the cost is one shortened breath when board_millis()
              * wraps, once every 49 days. */
-            led_level(heartbeat_level(now % HEARTBEAT_PERIOD_MS));
+            led_level(breath_level(now % BREATH_PERIOD_MS));
             s_next_blink = now + LED_STEP_MS;
         }
     }

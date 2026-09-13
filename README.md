@@ -294,8 +294,19 @@ trip. An SFLP ODR of 15 or 30 Hz would trip it constantly.
 * Bus: the whole protocol runs in `USART1_IRQHandler`, so a request is answered
   as soon as its last CRC byte lands. `return_delay_time` is 0, matching what
   the host asserts of the servos.
+* The USART runs in **FIFO mode** (v3): eight bytes of receive buffering, so
+  the ISR may be away for 80 µs at 1 Mbps before a byte is lost, against 10 µs
+  with the bare `RDR`. Both CRCs — the check on a request and the signature on
+  the reply — are table-driven, about 2 µs each. v2 computed them bitwise
+  (~25 µs each) with no FIFO, and also buffered and CRC-checked the host's
+  88-byte `SYNC_WRITE` every tick (~90 µs deaf); measured on the bus, v2
+  answered about 85 % of `SYNC_READ`s and was silent for the rest — and because
+  this board is first in the ID list, a silent IMU keeps every servo behind it
+  silent too, so each miss cost the host a whole tick plus its read timeout.
 * Foreign packets — about fifteen servo status packets per tick — are dropped at
-  the ID byte before any CRC is computed.
+  the ID byte before any CRC is computed. A broadcast whose instruction is not
+  `PING` or `SYNC_READ` (the `SYNC_WRITE` above) is dropped at the instruction
+  byte, for the same reason.
 * A gap of more than 100 µs between bytes abandons a part-received packet. Bytes
   inside a packet are 10 µs apart, so a real gap means the rest is not coming;
   without this, a truncated packet keeps counting its `LEN` down into the *next*
@@ -382,7 +393,7 @@ Rev 2, **TIM14_CH1 (AF13) on PA8** on Rev 1.
 
 | state | pattern |
 |---|---|
-| healthy | a faded **lub-dub** every 5 s: rise to full over 140 ms, decay, then a weaker second beat peaking at 65 %, dark from 700 ms |
+| healthy | **breathes**, continuously: a 2 s rise-and-fall between a faint floor and full, never dark (v3; v2 was a lub-dub every 5 s, which read as "blinked and stopped") |
 | fault | **~12 Hz** hard on/off, no fade |
 
 The two are unalike in kind, not just in rate - one breathes, the other strobes
@@ -407,7 +418,7 @@ Fault detection is unchanged: a bad `WHO_AM_I` at boot, or an SPI transfer
 timing out at any point after it. `bus_error` is refreshed every 2 ms poll, so
 a fault is held for 2 s - otherwise an intermittent failure would strobe for one
 poll and nobody would see it. A state change re-arms the timer immediately, so a
-fault appearing inside the quiet 4.3 s of a heartbeat shows up at once.
+fault appearing at the dim end of a breath shows up at once.
 
 A missing IMU does not stop the bus slave: the board still answers, with a zero
 block and `IMU_PRESENT` clear, which is diagnosable from the host. A silent

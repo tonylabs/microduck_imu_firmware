@@ -153,19 +153,57 @@ static void delay_us(uint16_t us)
 
 /*
  * CRC-16/IBM, polynomial 0x8005, initial value 0, not reflected - the Dynamixel
- * 2.0 CRC. Computed bitwise rather than from a table: 512 bytes of table would
- * buy about 20 us per packet on a part with 32 KB of flash and a 20 ms tick.
- * Note it covers the packet *after* byte stuffing, header included.
+ * 2.0 CRC. Note it covers the packet *after* byte stuffing, header included.
+ *
+ * Table-driven, and the table is the whole point. Every request is checked and
+ * every reply is signed from inside USART1_IRQHandler, with the receiver
+ * holding at most eight bytes - 80 us at 1 Mbps - behind it. Bitwise, the two
+ * CRCs around one SYNC_READ cost about 50 us of deaf ISR on a 48 MHz M0+, and
+ * the 88-byte SYNC_WRITE that precedes it on every tick cost 90 us on its own;
+ * measured on the bus, the board answered about 85% of the host's SYNC_READs
+ * and was silent for the rest. The table brings each CRC to about 2 us. 512
+ * bytes of flash, on a part with 32 KB of which this firmware uses 4.
  */
+static const uint16_t s_crc_table[256] = {
+    0x0000u, 0x8005u, 0x800Fu, 0x000Au, 0x801Bu, 0x001Eu, 0x0014u, 0x8011u,
+    0x8033u, 0x0036u, 0x003Cu, 0x8039u, 0x0028u, 0x802Du, 0x8027u, 0x0022u,
+    0x8063u, 0x0066u, 0x006Cu, 0x8069u, 0x0078u, 0x807Du, 0x8077u, 0x0072u,
+    0x0050u, 0x8055u, 0x805Fu, 0x005Au, 0x804Bu, 0x004Eu, 0x0044u, 0x8041u,
+    0x80C3u, 0x00C6u, 0x00CCu, 0x80C9u, 0x00D8u, 0x80DDu, 0x80D7u, 0x00D2u,
+    0x00F0u, 0x80F5u, 0x80FFu, 0x00FAu, 0x80EBu, 0x00EEu, 0x00E4u, 0x80E1u,
+    0x00A0u, 0x80A5u, 0x80AFu, 0x00AAu, 0x80BBu, 0x00BEu, 0x00B4u, 0x80B1u,
+    0x8093u, 0x0096u, 0x009Cu, 0x8099u, 0x0088u, 0x808Du, 0x8087u, 0x0082u,
+    0x8183u, 0x0186u, 0x018Cu, 0x8189u, 0x0198u, 0x819Du, 0x8197u, 0x0192u,
+    0x01B0u, 0x81B5u, 0x81BFu, 0x01BAu, 0x81ABu, 0x01AEu, 0x01A4u, 0x81A1u,
+    0x01E0u, 0x81E5u, 0x81EFu, 0x01EAu, 0x81FBu, 0x01FEu, 0x01F4u, 0x81F1u,
+    0x81D3u, 0x01D6u, 0x01DCu, 0x81D9u, 0x01C8u, 0x81CDu, 0x81C7u, 0x01C2u,
+    0x0140u, 0x8145u, 0x814Fu, 0x014Au, 0x815Bu, 0x015Eu, 0x0154u, 0x8151u,
+    0x8173u, 0x0176u, 0x017Cu, 0x8179u, 0x0168u, 0x816Du, 0x8167u, 0x0162u,
+    0x8123u, 0x0126u, 0x012Cu, 0x8129u, 0x0138u, 0x813Du, 0x8137u, 0x0132u,
+    0x0110u, 0x8115u, 0x811Fu, 0x011Au, 0x810Bu, 0x010Eu, 0x0104u, 0x8101u,
+    0x8303u, 0x0306u, 0x030Cu, 0x8309u, 0x0318u, 0x831Du, 0x8317u, 0x0312u,
+    0x0330u, 0x8335u, 0x833Fu, 0x033Au, 0x832Bu, 0x032Eu, 0x0324u, 0x8321u,
+    0x0360u, 0x8365u, 0x836Fu, 0x036Au, 0x837Bu, 0x037Eu, 0x0374u, 0x8371u,
+    0x8353u, 0x0356u, 0x035Cu, 0x8359u, 0x0348u, 0x834Du, 0x8347u, 0x0342u,
+    0x03C0u, 0x83C5u, 0x83CFu, 0x03CAu, 0x83DBu, 0x03DEu, 0x03D4u, 0x83D1u,
+    0x83F3u, 0x03F6u, 0x03FCu, 0x83F9u, 0x03E8u, 0x83EDu, 0x83E7u, 0x03E2u,
+    0x83A3u, 0x03A6u, 0x03ACu, 0x83A9u, 0x03B8u, 0x83BDu, 0x83B7u, 0x03B2u,
+    0x0390u, 0x8395u, 0x839Fu, 0x039Au, 0x838Bu, 0x038Eu, 0x0384u, 0x8381u,
+    0x0280u, 0x8285u, 0x828Fu, 0x028Au, 0x829Bu, 0x029Eu, 0x0294u, 0x8291u,
+    0x82B3u, 0x02B6u, 0x02BCu, 0x82B9u, 0x02A8u, 0x82ADu, 0x82A7u, 0x02A2u,
+    0x82E3u, 0x02E6u, 0x02ECu, 0x82E9u, 0x02F8u, 0x82FDu, 0x82F7u, 0x02F2u,
+    0x02D0u, 0x82D5u, 0x82DFu, 0x02DAu, 0x82CBu, 0x02CEu, 0x02C4u, 0x82C1u,
+    0x8243u, 0x0246u, 0x024Cu, 0x8249u, 0x0258u, 0x825Du, 0x8257u, 0x0252u,
+    0x0270u, 0x8275u, 0x827Fu, 0x027Au, 0x826Bu, 0x026Eu, 0x0264u, 0x8261u,
+    0x0220u, 0x8225u, 0x822Fu, 0x022Au, 0x823Bu, 0x023Eu, 0x0234u, 0x8231u,
+    0x8213u, 0x0216u, 0x021Cu, 0x8219u, 0x0208u, 0x820Du, 0x8207u, 0x0202u,
+};
+
 static uint16_t dxl_crc(const uint8_t *data, uint16_t len)
 {
     uint16_t crc = 0u;
     for (uint16_t i = 0u; i < len; i++) {
-        crc ^= (uint16_t)((uint16_t)data[i] << 8);
-        for (uint8_t bit = 0u; bit < 8u; bit++) {
-            crc = (crc & 0x8000u) ? (uint16_t)((crc << 1) ^ 0x8005u)
-                                  : (uint16_t)(crc << 1);
-        }
+        crc = (uint16_t)((crc << 8) ^ s_crc_table[((crc >> 8) ^ data[i]) & 0xFFu]);
     }
     return crc;
 }
@@ -474,6 +512,18 @@ static void rx_byte(uint8_t b)
         break;
 
     case S_BODY:
+        /* The first body byte is the instruction. A broadcast that is not a
+         * PING or a SYNC_READ is nobody's business here - it is the host's
+         * 88-byte SYNC_WRITE of goal positions, once a tick - so it is dropped
+         * now rather than buffered, CRC-checked and then ignored. Buffering
+         * it cost the receiver the ~90 us the CRC took, which is exactly the
+         * moment the next SYNC_READ starts arriving after a tick the host had
+         * to skip. */
+        if (s_rx_pos == 0u && s_rx[4] == DXL_BROADCAST_ID
+            && b != INST_PING && b != INST_SYNC_READ) {
+            s_state = S_FF1;
+            break;
+        }
         s_rx[7u + s_rx_pos] = b;
         s_rx_pos++;
         if (s_rx_pos >= s_rx_len) {
@@ -492,26 +542,38 @@ static void rx_byte(uint8_t b)
 
 void USART1_IRQHandler(void)
 {
-    uint32_t isr = USART1->ISR;
-    uint32_t cr1 = USART1->CR1;
-
-    if ((isr & USART_ISR_RXNE_RXFNE) != 0u) {
+    /* FIFO mode: RXFNE means "not empty", so drain it - one entry per pass
+     * would leave the rest for a re-entry each, and the whole point of the
+     * FIFO is to absorb the ISR's own worst case. Re-read ISR each time; a
+     * byte can land between two iterations. */
+    while ((USART1->ISR & USART_ISR_RXNE_RXFNE) != 0u) {
         rx_byte((uint8_t)USART1->RDR);
     }
 
-    if (((isr & USART_ISR_TXE_TXFNF) != 0u) && ((cr1 & USART_CR1_TXEIE_TXFNFIE) != 0u)) {
-        if (s_tx_pos < s_tx_len) {
+    uint32_t cr1 = USART1->CR1;
+    if ((cr1 & USART_CR1_TXEIE_TXFNFIE) != 0u) {
+        /* TXFNF means "not full": push as much of the reply as fits. */
+        while (s_tx_pos < s_tx_len && (USART1->ISR & USART_ISR_TXE_TXFNF) != 0u) {
             USART1->TDR = s_tx[s_tx_pos++];
-        } else {
+        }
+        if (s_tx_pos >= s_tx_len) {
             USART1->CR1 = (USART1->CR1 & ~USART_CR1_TXEIE_TXFNFIE) | USART_CR1_TCIE;
         }
     }
+
+    uint32_t isr = USART1->ISR;
+    cr1 = USART1->CR1;
 
     if (((isr & USART_ISR_TC) != 0u) && ((cr1 & USART_CR1_TCIE) != 0u)) {
         USART1->ICR = USART_ICR_TCCF;
         USART1->CR1 &= ~USART_CR1_TCIE;
         line_release();
-        /* Drop anything the receiver latched while the line was ours. */
+        /* Drop anything the receiver latched while the line was ours. RE was
+         * clear, so this should be nothing; read the FIFO out regardless
+         * rather than trust that. */
+        while ((USART1->ISR & USART_ISR_RXNE_RXFNE) != 0u) {
+            (void)USART1->RDR;
+        }
         USART1->RQR = USART_RQR_RXFRQ;
         USART1->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_NECF;
         USART1->CR1 |= USART_CR1_RE;
@@ -623,6 +685,11 @@ void dxl_slave_init(void)
      * board where USART1_RX has nowhere to go. */
     USART1->CR3 = USART_CR3_HDSEL | USART_CR3_OVRDIS;
 #endif
+    /* FIFO mode: eight bytes of receive buffering, so the ISR may be away for
+     * up to 80 us at 1 Mbps before a byte is lost, against 10 us with the bare
+     * RDR. That covers a CRC, a reply being framed, and the SPI poll's
+     * critical section together. Must be set before UE. */
+    USART1->CR1 |= USART_CR1_FIFOEN;
     USART1->CR1 |= USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE_RXFNEIE;
     USART1->CR1 |= USART_CR1_UE;
 
