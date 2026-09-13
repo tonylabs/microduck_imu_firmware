@@ -78,7 +78,7 @@ Also served, for bus scans and diagnostics:
 | 3 | 1 | ID (200) |
 | 4 | 1 | baud rate code (3 = 1 Mbps) |
 | 5 | 1 | return delay time (0) |
-| 8 | 14 | diagnostic counters (v4), seven `u16` LE, wrapping, never cleared — take differences: requests that reached the parser, CRC failures, mid-packet gap resets, receiver FE/NE/ORE, `SYNC_READ`s answered, replies framed, replies completed (TC). `read 200 8 14` after a run says where a request the host never got an answer to actually died |
+| 8 | 16 | diagnostic counters (v4), eight `u16` LE, wrapping, never cleared — take differences: requests that reached the parser, CRC failures, mid-packet gap resets, receiver FE/NE/ORE, `SYNC_READ`s answered, replies framed, replies completed (TC), largest mid-packet gap tolerated (µs, v5). `read 200 8 16` after a run says where a request the host never got an answer to actually died |
 
 Supported instructions: `PING` (0x01), `READ` (0x02), `WRITE` (0x03, accepted
 and ignored — nothing is writable), `SYNC_READ` (0x82).
@@ -308,8 +308,12 @@ trip. An SFLP ODR of 15 or 30 Hz would trip it constantly.
   the ID byte before any CRC is computed. A broadcast whose instruction is not
   `PING` or `SYNC_READ` (the `SYNC_WRITE` above) is dropped at the instruction
   byte, for the same reason.
-* A gap of more than 100 µs between bytes abandons a part-received packet. Bytes
-  inside a packet are 10 µs apart, so a real gap means the rest is not coming;
+* A gap of more than 2 ms between bytes abandons a part-received packet (v5;
+  it was 100 µs, and the Radxa's UART — which refills its transmit FIFO from an
+  interrupt that is routinely 100–300 µs late — was tripping it on 3–9 % of
+  requests, every one of them otherwise clean). Bytes inside a packet are 10 µs
+  apart and the next request is a 20 ms tick away, so a real gap still means
+  the rest is not coming;
   without this, a truncated packet keeps counting its `LEN` down into the *next*
   packet's bytes and costs a second transaction too — a whole missed control
   tick. Resynchronising on the header instead is tempting, since byte stuffing
