@@ -108,6 +108,36 @@ static uint16_t s_last_rx_us; /* TIM3 stamp of the previous byte           */
  *  FF payload bytes would be thrown away. A gap cannot be faked that way. */
 #define RX_IDLE_RESET_US 100u
 
+/* -- diagnostic counters ---------------------------------------------------
+ *
+ * Served in the control table at DXL_DIAG_ADDR, u16 little-endian each, so a
+ * host can read them over the bus and see where a request it never got an
+ * answer to actually died: never assembled (bytes lost - compare `ours` to
+ * what was sent), assembled but corrupt (`crc_fail`), a gap mid-packet
+ * (`gap_reset`), the receiver flagging framing/noise/overrun (`line_err`),
+ * served but the reply never completed (`served` vs `tx_done`). Wrap at 65536
+ * and are never cleared; the host takes differences. */
+enum {
+    DIAG_OURS = 0,   /* headers with our ID or broadcast, reached packet_complete */
+    DIAG_CRC_FAIL,   /* ... and failed CRC */
+    DIAG_GAP_RESET,  /* part-received packet abandoned on a >100 us gap */
+    DIAG_LINE_ERR,   /* FE / NE / ORE seen by the receiver */
+    DIAG_SERVED_SR,  /* SYNC_READ answered */
+    DIAG_SERVED_RD,  /* every reply framed, SYNC_READ ones included */
+    DIAG_TX_DONE,    /* replies whose last bit left the wire (TC) */
+    DIAG_COUNT
+};
+#define DXL_DIAG_ADDR 8u
+
+static uint16_t s_diag[DIAG_COUNT];
+
+static inline void diag_bump(uint8_t which)
+{
+    s_diag[which]++;
+    s_table[DXL_DIAG_ADDR + (which * 2u)]      = (uint8_t)(s_diag[which] & 0xFFu);
+    s_table[DXL_DIAG_ADDR + (which * 2u) + 1u] = (uint8_t)(s_diag[which] >> 8);
+}
+
 static uint8_t  s_tx[DXL_TX_MAX];
 static uint16_t s_tx_len;
 static volatile uint16_t s_tx_pos;
@@ -301,6 +331,7 @@ static void respond(uint8_t err, const volatile uint8_t *params, uint16_t nparam
     s_tx[n++] = (uint8_t)(crc >> 8);
 
     s_tx_len = n;
+    diag_bump(DIAG_SERVED_RD);
     tx_start();
 }
 
@@ -391,6 +422,7 @@ static void handle_packet(uint8_t id, const uint8_t *body, uint16_t nbody)
                 delay_us((uint16_t)(i * slot_us(len)));
             }
             serve_read(addr, len);
+            diag_bump(DIAG_SERVED_SR);
             break;
         }
         break;
@@ -410,9 +442,11 @@ static void packet_complete(void)
 {
     uint16_t total = (uint16_t)(7u + s_rx_len);
 
+    diag_bump(DIAG_OURS);
     uint16_t want = dxl_crc(s_rx, (uint16_t)(total - 2u));
     uint16_t got = (uint16_t)(s_rx[total - 2u] | ((uint16_t)s_rx[total - 1u] << 8));
     if (want != got) {
+        diag_bump(DIAG_CRC_FAIL);
         return;
     }
 
@@ -450,6 +484,7 @@ static void rx_byte(uint8_t b)
     uint16_t now = (uint16_t)TIM3->CNT;
     if (s_state != S_FF1 && (uint16_t)(now - s_last_rx_us) > RX_IDLE_RESET_US) {
         s_state = S_FF1;
+        diag_bump(DIAG_GAP_RESET);
     }
     s_last_rx_us = now;
 
@@ -547,6 +582,11 @@ void USART1_IRQHandler(void)
      * FIFO is to absorb the ISR's own worst case. Re-read ISR each time; a
      * byte can land between two iterations. */
     while ((USART1->ISR & USART_ISR_RXNE_RXFNE) != 0u) {
+        uint32_t flags = USART1->ISR & (USART_ISR_FE | USART_ISR_NE | USART_ISR_ORE);
+        if (flags != 0u) {
+            USART1->ICR = USART_ICR_FECF | USART_ICR_NECF | USART_ICR_ORECF;
+            diag_bump(DIAG_LINE_ERR);
+        }
         rx_byte((uint8_t)USART1->RDR);
     }
 
@@ -567,6 +607,7 @@ void USART1_IRQHandler(void)
     if (((isr & USART_ISR_TC) != 0u) && ((cr1 & USART_CR1_TCIE) != 0u)) {
         USART1->ICR = USART_ICR_TCCF;
         USART1->CR1 &= ~USART_CR1_TCIE;
+        diag_bump(DIAG_TX_DONE);
         line_release();
         /* Drop anything the receiver latched while the line was ours. RE was
          * clear, so this should be nothing; read the FIFO out regardless

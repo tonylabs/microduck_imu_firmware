@@ -78,6 +78,7 @@ Also served, for bus scans and diagnostics:
 | 3 | 1 | ID (200) |
 | 4 | 1 | baud rate code (3 = 1 Mbps) |
 | 5 | 1 | return delay time (0) |
+| 8 | 14 | diagnostic counters (v4), seven `u16` LE, wrapping, never cleared — take differences: requests that reached the parser, CRC failures, mid-packet gap resets, receiver FE/NE/ORE, `SYNC_READ`s answered, replies framed, replies completed (TC). `read 200 8 14` after a run says where a request the host never got an answer to actually died |
 
 Supported instructions: `PING` (0x01), `READ` (0x02), `WRITE` (0x03, accepted
 and ignored — nothing is writable), `SYNC_READ` (0x82).
