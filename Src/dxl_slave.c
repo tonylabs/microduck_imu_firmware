@@ -106,7 +106,15 @@ static uint16_t s_last_rx_us; /* TIM3 stamp of the previous byte           */
  *  keeps FF FF FD 00 out of any payload - but not out of the two CRC bytes,
  *  which are not stuffed, so a packet whose CRC happened to be 00 FD after two
  *  FF payload bytes would be thrown away. A gap cannot be faked that way. */
-#define RX_IDLE_RESET_US 100u
+#define RX_IDLE_RESET_US 2000u
+
+/* 2 ms, not the 100 us it was. The host's UART loads its transmit FIFO in
+ * chunks and the line idles until an interrupt refills it, and on the Radxa
+ * that interrupt is routinely 100-300 us late: measured with the v4 counters,
+ * the 100 us rule abandoned 9 of 300 fifteen-byte requests and 26 of 300
+ * thirty-byte ones - every one of them clean, no CRC or line error, just a
+ * pause in the middle. A truncated packet is still abandoned long before the
+ * next request, which is a control tick (20 ms) away. */
 
 /* -- diagnostic counters ---------------------------------------------------
  *
@@ -125,17 +133,31 @@ enum {
     DIAG_SERVED_SR,  /* SYNC_READ answered */
     DIAG_SERVED_RD,  /* every reply framed, SYNC_READ ones included */
     DIAG_TX_DONE,    /* replies whose last bit left the wire (TC) */
+    DIAG_MAX_GAP_US, /* largest mid-packet inter-byte gap tolerated so far */
     DIAG_COUNT
 };
 #define DXL_DIAG_ADDR 8u
 
 static uint16_t s_diag[DIAG_COUNT];
 
+static inline void diag_store(uint8_t which)
+{
+    s_table[DXL_DIAG_ADDR + (which * 2u)]      = (uint8_t)(s_diag[which] & 0xFFu);
+    s_table[DXL_DIAG_ADDR + (which * 2u) + 1u] = (uint8_t)(s_diag[which] >> 8);
+}
+
 static inline void diag_bump(uint8_t which)
 {
     s_diag[which]++;
-    s_table[DXL_DIAG_ADDR + (which * 2u)]      = (uint8_t)(s_diag[which] & 0xFFu);
-    s_table[DXL_DIAG_ADDR + (which * 2u) + 1u] = (uint8_t)(s_diag[which] >> 8);
+    diag_store(which);
+}
+
+static inline void diag_max(uint8_t which, uint16_t v)
+{
+    if (v > s_diag[which]) {
+        s_diag[which] = v;
+        diag_store(which);
+    }
 }
 
 static uint8_t  s_tx[DXL_TX_MAX];
@@ -482,9 +504,14 @@ static void packet_complete(void)
 static void rx_byte(uint8_t b)
 {
     uint16_t now = (uint16_t)TIM3->CNT;
-    if (s_state != S_FF1 && (uint16_t)(now - s_last_rx_us) > RX_IDLE_RESET_US) {
-        s_state = S_FF1;
-        diag_bump(DIAG_GAP_RESET);
+    if (s_state != S_FF1) {
+        uint16_t gap = (uint16_t)(now - s_last_rx_us);
+        if (gap > RX_IDLE_RESET_US) {
+            s_state = S_FF1;
+            diag_bump(DIAG_GAP_RESET);
+        } else {
+            diag_max(DIAG_MAX_GAP_US, gap);
+        }
     }
     s_last_rx_us = now;
 
