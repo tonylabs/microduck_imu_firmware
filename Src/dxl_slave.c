@@ -134,6 +134,9 @@ enum {
     DIAG_SERVED_RD,  /* every reply framed, SYNC_READ ones included */
     DIAG_TX_DONE,    /* replies whose last bit left the wire (TC) */
     DIAG_MAX_GAP_US, /* largest mid-packet inter-byte gap tolerated so far */
+    DIAG_LAST_GAP_US,/* the gap that caused the most recent reset, us (saturates) */
+    DIAG_LAST_GAP_AT,/* ... and how many bytes into the packet it struck */
+    DIAG_OVERRUN,    /* receiver overruns (ORE), now that they are reported */
     DIAG_COUNT
 };
 #define DXL_DIAG_ADDR 8u
@@ -149,6 +152,12 @@ static inline void diag_store(uint8_t which)
 static inline void diag_bump(uint8_t which)
 {
     s_diag[which]++;
+    diag_store(which);
+}
+
+static inline void diag_set(uint8_t which, uint16_t v)
+{
+    s_diag[which] = v;
     diag_store(which);
 }
 
@@ -507,6 +516,11 @@ static void rx_byte(uint8_t b)
     if (s_state != S_FF1) {
         uint16_t gap = (uint16_t)(now - s_last_rx_us);
         if (gap > RX_IDLE_RESET_US) {
+            /* How far the abandoned packet had got: header bytes by state,
+             * then the body count. */
+            uint16_t at = (s_state == S_BODY) ? (uint16_t)(7u + s_rx_pos) : (uint16_t)s_state;
+            diag_set(DIAG_LAST_GAP_US, gap);
+            diag_set(DIAG_LAST_GAP_AT, at);
             s_state = S_FF1;
             diag_bump(DIAG_GAP_RESET);
         } else {
@@ -612,7 +626,7 @@ void USART1_IRQHandler(void)
         uint32_t flags = USART1->ISR & (USART_ISR_FE | USART_ISR_NE | USART_ISR_ORE);
         if (flags != 0u) {
             USART1->ICR = USART_ICR_FECF | USART_ICR_NECF | USART_ICR_ORECF;
-            diag_bump(DIAG_LINE_ERR);
+            diag_bump(((flags & USART_ISR_ORE) != 0u) ? DIAG_OVERRUN : DIAG_LINE_ERR);
         }
         rx_byte((uint8_t)USART1->RDR);
     }
@@ -746,7 +760,10 @@ void dxl_slave_init(void)
      * match U5's OE#. DEAT/DEDT: assert 4/16 of a bit before the start bit and
      * hold 4/16 after the stop bit - 250 ns each at 1 Mbps, which is fifty
      * times U5's enable time and invisible next to the 10 us byte. */
-    USART1->CR3 = USART_CR3_DEM | USART_CR3_DEP | USART_CR3_OVRDIS;
+    /* ORE is reported (no OVRDIS): with a FIFO an overrun means the ISR was
+     * away for eight byte times, which is worth counting, and the TC handler
+     * flushes the receiver and clears the flag before RE comes back on. */
+    USART1->CR3 = USART_CR3_DEM | USART_CR3_DEP;
     USART1->CR1 = (4u << USART_CR1_DEAT_Pos) | (4u << USART_CR1_DEDT_Pos);
 #else
     /* HDSEL wires the receiver to the TX pin - the only way to receive on a
