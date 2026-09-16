@@ -271,28 +271,37 @@ void app_task(void)
 
     (void)lsm6dsv16x_poll(&s_sample);
 
-    /* Per-robot mounting trim, before anything is published - mount.h. */
-    mount_correct_vec(s_sample.gyro);
-    mount_correct_vec(s_sample.acc);
+    /* Per-robot mounting trim, before anything is published - mount.h.
+     *
+     * On copies, never on s_sample itself. The gyro and accelerometer are
+     * re-read from the chip every poll, but the quaternion only changes when
+     * the FIFO delivers one (120 Hz against a 500 Hz poll), so correcting it in
+     * place applied the rotation again on every poll until the next sample -
+     * a static robot published four or five different orientations in turn. */
+    int16_t  gyro[3] = { s_sample.gyro[0], s_sample.gyro[1], s_sample.gyro[2] };
+    int16_t  acc[3]  = { s_sample.acc[0], s_sample.acc[1], s_sample.acc[2] };
+    uint16_t quat[3] = { s_sample.quat[0], s_sample.quat[1], s_sample.quat[2] };
+    mount_correct_vec(gyro);
+    mount_correct_vec(acc);
     if (s_sample.quat_valid) {
-        mount_correct_quat(s_sample.quat);
+        mount_correct_quat(quat);
     }
 
     uint8_t block[DXL_SENSOR_LEN];
-    put_i16(&block[0], s_sample.gyro[0]);
-    put_i16(&block[2], s_sample.gyro[1]);
-    put_i16(&block[4], s_sample.gyro[2]);
+    put_i16(&block[0], gyro[0]);
+    put_i16(&block[2], gyro[1]);
+    put_i16(&block[4], gyro[2]);
     /* Left at zero until SFLP has written its table. The host reads all-zero
      * here as "orientation unknown" and holds its last good quaternion, which
      * is the only honest answer during the ~0.7 s the algorithm takes to
      * settle - reporting identity would tell fall detection the robot is
      * upright. */
-    put_u16(&block[6], s_sample.quat_valid ? s_sample.quat[0] : 0u);
-    put_u16(&block[8], s_sample.quat_valid ? s_sample.quat[1] : 0u);
-    put_u16(&block[10], s_sample.quat_valid ? s_sample.quat[2] : 0u);
-    put_i16(&block[12], s_sample.acc[0]);
-    put_i16(&block[14], s_sample.acc[1]);
-    put_i16(&block[16], s_sample.acc[2]);
+    put_u16(&block[6], s_sample.quat_valid ? quat[0] : 0u);
+    put_u16(&block[8], s_sample.quat_valid ? quat[1] : 0u);
+    put_u16(&block[10], s_sample.quat_valid ? quat[2] : 0u);
+    put_i16(&block[12], acc[0]);
+    put_i16(&block[14], acc[1]);
+    put_i16(&block[16], acc[2]);
 
     /* The counter is what tells the host a block is genuinely new. duck-control
      * already watches for a repeated 12-byte block and calls the orientation

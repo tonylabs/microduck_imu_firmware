@@ -44,7 +44,7 @@
 #define DXL_MODEL_NUMBER 0xC011u
 
 /** Bumped when the layout of the block at 124 changes. */
-#define DXL_FIRMWARE_VERSION 8u
+#define DXL_FIRMWARE_VERSION 9u
 
 /** Start and length of the sensor block. */
 #define DXL_SENSOR_ADDR 124u
