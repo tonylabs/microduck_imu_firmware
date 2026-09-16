@@ -396,16 +396,16 @@ packet and nowhere else.
 
 D2's anode sits on +3.3 V through a 1 k resistor, so the LED pin **sinks** - low
 is lit. The pin is driven as PWM at 999 Hz with 1000 duty steps, which is what
-lets the healthy pattern fade instead of switch: **TIM1_CH4 (AF2) on PA11** on
+lets the second beat be dimmer than the first: **TIM1_CH4 (AF2) on PA11** on
 Rev 2, **TIM14_CH1 (AF13) on PA8** on Rev 1.
 
 | state | pattern |
 |---|---|
-| healthy | **breathes**, continuously: a 2 s rise-and-fall between a faint floor and full, never dark (v3; v2 was a lub-dub every 5 s, which read as "blinked and stopped") |
-| fault | **~12 Hz** hard on/off, no fade |
+| healthy | **heartbeat**, 60 bpm: an 80 ms lub at full, 120 ms dark, a 60 ms softer dub, then dark until the next beat. Hard edges, no fade (v8; v3–v7 was a 2 s breath, too slow and soft to read as alive; v2 was a lub-dub every 5 s, which read as "blinked and stopped") |
+| fault | **~12 Hz** hard on/off |
 
-The two are unalike in kind, not just in rate - one breathes, the other strobes
-- so which one you are looking at is obvious at a glance instead of needing to
+The two are unalike in kind, not just in rate - one beats, the other strobes -
+so which one you are looking at is obvious at a glance instead of needing to
 be timed.
 
 Three details that matter more than they look:
@@ -418,15 +418,15 @@ Three details that matter more than they look:
   counts, CCR updates, the pin never moves.
 * **`CCxP` inverts the channel**, so `CCRx` reads as brightness rather than as
   darkness on a pin that sinks.
-* **Duty is the square of the level.** The eye is not linear; a linear ramp
-  spends most of its travel in a range that already looks fully lit, and reads
-  as a switch with a soft edge rather than as breathing.
+* **Duty is the square of the level.** The eye is not linear; without it the
+  dub at level 600 looks nearly as bright as the lub at 1000, and the beat
+  loses its second, quieter sound.
 
 Fault detection is unchanged: a bad `WHO_AM_I` at boot, or an SPI transfer
 timing out at any point after it. `bus_error` is refreshed every 2 ms poll, so
 a fault is held for 2 s - otherwise an intermittent failure would strobe for one
 poll and nobody would see it. A state change re-arms the timer immediately, so a
-fault appearing at the dim end of a breath shows up at once.
+fault appearing in the rest between beats shows up at once.
 
 A missing IMU does not stop the bus slave: the board still answers, with a zero
 block and `IMU_PRESENT` clear, which is diagnosable from the host. A silent

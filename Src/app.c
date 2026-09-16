@@ -28,29 +28,38 @@
 /*
  * LED, in two states.
  *
- *   healthy  the IMU answered WHO_AM_I: breathes, continuously, two seconds a
- *            breath, never quite dark
+ *   healthy  the IMU answered WHO_AM_I: a heartbeat, lub-dub at 60 bpm, hard
+ *            edges
  *   fault    it did not, or an SPI transfer is failing: ~12 Hz, hard edges
  *
- * The two are deliberately unalike in kind and not just in rate - one breathes,
+ * The two are deliberately unalike in kind and not just in rate - one beats,
  * the other strobes - so which one you are looking at is obvious from across a
  * room and after a glance, rather than needing to be timed.
  *
- * It used to be a lub-dub every five seconds: two beats in 700 ms and then
- * 4.3 s of dark, which from the bench reads as "blinked a few times and
- * stopped" rather than as alive. A breath has no dark gap to misread.
+ * History: v2 was a lub-dub every five seconds, which from the bench read as
+ * "blinked a few times and stopped". v3 replaced it with a 2 s breath, which
+ * had no dark gap to misread but was too slow and too soft to read as alive.
+ * v8 goes back to the heartbeat at a resting human rate: the gap between beats
+ * is under a second, so nothing looks stopped, and the double pulse is
+ * unmistakably a pulse.
  */
-#define BREATH_PERIOD_MS 2000u
-#define BLINK_FAULT_MS     40u
+#define BEAT_PERIOD_MS 1000u /* 60 bpm */
+#define BLINK_FAULT_MS   40u
 
-/** Where a breath bottoms out, 0..LED_MAX. Not zero: a moment of dark at the
- *  end of every breath is the "stopped" the pattern exists to avoid. After
- *  led_duty() squares it this is under 1 % duty - a glow, not a light. */
-#define BREATH_FLOOR 80u
+/** The two pulses of a beat, ms into the period. Lub then dub, the dub softer
+ *  and close behind - roughly the S1/S2 spacing of a real heart, then a rest
+ *  for the remainder of the period. Everything between them is dark. */
+#define LUB_ON_MS     0u
+#define LUB_OFF_MS   80u
+#define DUB_ON_MS   200u
+#define DUB_OFF_MS  260u
 
-/** Envelope update interval. 4 ms gives 250 steps across a breath's rise,
- *  which is smooth to the eye, and costs one multiply and one divide per step
- *  on a loop that is idle 95 % of the time. */
+/** Dub brightness, 0..LED_MAX. After led_duty() squares it, about a third of
+ *  the lub's light - clearly the second, quieter sound. */
+#define DUB_LEVEL 600u
+
+/** Envelope update interval. The pattern is switched, not faded, so this only
+ *  bounds how late an edge can be; 4 ms is invisible against 80 ms pulses. */
 #define LED_STEP_MS 4u
 
 /** How long a fault keeps the LED fast after the last SPI error.
@@ -71,8 +80,8 @@ static uint32_t s_last_error_ms;
 static bool     s_fault_shown;
 
 /*
- * The LED is a ~1 kHz PWM on a timer channel, so the healthy pattern can fade
- * rather than switch. Which timer and pin is the board's business - board.h
+ * The LED is a ~1 kHz PWM on a timer channel, so the dub can be dimmer than
+ * the lub. Which timer and pin is the board's business - board.h
  * names LED_TIM / LED_PIN_NUM / LED_AF per revision.
  *
  * Not TIM3, on any revision: TIM3 is the microsecond clock the Dynamixel slave
@@ -110,9 +119,8 @@ static bool     s_fault_shown;
 /**
  * Brightness 0..LED_MAX to duty.
  *
- * Squared, because the eye is not linear: a linear ramp spends most of its
- * travel in a range that already looks fully lit, so the fade reads as a
- * switch with a soft edge rather than as breathing.
+ * Squared, because the eye is not linear: without it a level of 600 looks
+ * nearly as bright as 1000, and the dub would not read as the softer beat.
  */
 static uint16_t led_duty(uint16_t level)
 {
@@ -158,34 +166,19 @@ static void led_init(void)
                     | (2u << (LED_PIN_NUM * 2));
 }
 
-/** Linear interpolation over a segment of the LED envelope. */
-static uint16_t ramp(uint32_t t, uint32_t t0, uint32_t t1, uint32_t v0, uint32_t v1)
-{
-    if (t <= t0) {
-        return (uint16_t)v0;
-    }
-    if (t >= t1) {
-        return (uint16_t)v1;
-    }
-    uint32_t span = t1 - t0;
-    uint32_t into = t - t0;
-    return (v1 >= v0) ? (uint16_t)(v0 + ((v1 - v0) * into) / span)
-                      : (uint16_t)(v0 - ((v0 - v1) * into) / span);
-}
-
 /**
- * One breath over BREATH_PERIOD_MS: a rise to full and a fall back to the
- * floor, both linear in level. led_duty() squares the level, so in light this
- * comes out as a slow start, a quick brighten and an easing-off at the top -
- * near enough a sine that nobody times it - and the same in reverse.
+ * One beat over BEAT_PERIOD_MS: lub, dark, softer dub, dark. Switched, not
+ * ramped - a heartbeat is a thump, and a fade is what the v3 breath was.
  */
-static uint16_t breath_level(uint32_t phase_ms)
+static uint16_t heartbeat_level(uint32_t phase_ms)
 {
-    const uint32_t half = BREATH_PERIOD_MS / 2u;
-    if (phase_ms < half) {
-        return ramp(phase_ms, 0u, half, BREATH_FLOOR, LED_MAX);
+    if (phase_ms >= LUB_ON_MS && phase_ms < LUB_OFF_MS) {
+        return LED_MAX;
     }
-    return ramp(phase_ms, half, BREATH_PERIOD_MS, LED_MAX, BREATH_FLOOR);
+    if (phase_ms >= DUB_ON_MS && phase_ms < DUB_OFF_MS) {
+        return DUB_LEVEL;
+    }
+    return 0u;
 }
 
 static void put_i16(uint8_t *dst, int16_t v)
@@ -255,9 +248,9 @@ void app_task(void)
             s_next_blink = now + BLINK_FAULT_MS;
         } else {
             /* Free-running phase off the millisecond clock. It needs no state
-             * of its own; the cost is one shortened breath when board_millis()
+             * of its own; the cost is one shortened beat when board_millis()
              * wraps, once every 49 days. */
-            led_level(breath_level(now % BREATH_PERIOD_MS));
+            led_level(heartbeat_level(now % BEAT_PERIOD_MS));
             s_next_blink = now + LED_STEP_MS;
         }
     }
