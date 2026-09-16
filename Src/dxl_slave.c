@@ -796,6 +796,19 @@ void dxl_slave_publish(const uint8_t *block)
     __set_PRIMASK(primask);
 }
 
+void dxl_slave_set_static(uint16_t addr, const uint8_t *data, uint16_t len)
+{
+    if (addr >= DXL_SENSOR_ADDR || (uint32_t)addr + len > DXL_SENSOR_ADDR) {
+        return; /* the sensor block is publish()'s, not this */
+    }
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    for (uint16_t i = 0u; i < len; i++) {
+        s_table[addr + i] = data[i];
+    }
+    __set_PRIMASK(primask);
+}
+
 uint32_t dxl_slave_replies(void)
 {
     return s_replies;

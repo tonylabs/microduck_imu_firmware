@@ -67,7 +67,8 @@ fault unambiguous.
 | 19 | 1 | status flags |
 
 Status flags: `0x01` IMU present (WHO_AM_I matched), `0x02` SFLP ready,
-`0x04` FIFO overran since last publish, `0x08` SPI transfer timed out.
+`0x04` FIFO overran since last publish, `0x08` SPI transfer timed out,
+`0x10` a mounting correction is applied (v7, below).
 
 Also served, for bus scans and diagnostics:
 
@@ -78,6 +79,7 @@ Also served, for bus scans and diagnostics:
 | 3 | 1 | ID (200) |
 | 4 | 1 | baud rate code (3 = 1 Mbps) |
 | 5 | 1 | return delay time (0) |
+| 32 | 8 | mounting correction in force (v7): the sensor-frame quaternion w, x, y, z as four `i16` × 10000. `(10000, 0, 0, 0)` means none |
 | 8 | 22 | diagnostic counters (v4), eleven `u16` LE, wrapping, never cleared — take differences: requests that reached the parser, CRC failures, mid-packet gap resets, receiver FE/NE/ORE, `SYNC_READ`s answered, replies framed, replies completed (TC), largest mid-packet gap tolerated (µs, v5), the gap that caused the last reset and the byte it struck at, receiver overruns (v6). `read 200 8 22` after a run says where a request the host never got an answer to actually died |
 
 Supported instructions: `PING` (0x01), `READ` (0x02), `WRITE` (0x03, accepted
@@ -255,6 +257,7 @@ whose peripherals are all configured by hand it costs little.
 | `Src/lsm6dsv16x.c` | SPI1 at register level; chip config; FIFO drain for SFLP |
 | `Src/dxl_slave.c` | Protocol 2.0 slave on USART1, all in the ISR; hardware DE (Rev 2) or HDSEL + open-drain (Rev 1) |
 | `Src/app.c` | poll loop, sensor block assembly, LED |
+| `Src/mount.c`, `Inc/mount.h` | per-robot mounting correction (v7): a fixed sensor-frame rotation applied to gyro, accel and the SFLP quaternion before publishing, so a board mounted a few degrees off reads as mounted straight. The host has no trim for this; the constants and the measurement procedure are in `mount.h` |
 
 From the CubeIDE template and not worth reading: `Src/syscalls.c`,
 `Src/sysmem.c`, `Src/system_stm32c0xx.c`, `Startup/`, `STM32C011F6UX_FLASH.ld`.

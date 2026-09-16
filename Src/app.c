@@ -14,6 +14,7 @@
  */
 
 #include "app.h"
+#include "mount.h"
 
 #include <string.h>
 
@@ -211,6 +212,15 @@ void app_init(void)
      * silent looks the same as an unplugged connector. */
     dxl_slave_init();
 
+    /* The mounting correction in force, so a host can read what this board is
+     * doing to its samples rather than infer it. */
+    {
+        int16_t c[4]; uint8_t raw[8];
+        mount_correction_i16(c);
+        for (int i = 0; i < 4; i++) { put_i16(&raw[i * 2], c[i]); }
+        dxl_slave_set_static(DXL_MOUNT_ADDR, raw, 8u);
+    }
+
     s_next_poll = board_millis();
     s_next_blink = s_next_poll;
     /* Unsigned wraparound puts this exactly FAULT_HOLD_MS in the past however
@@ -268,6 +278,13 @@ void app_task(void)
 
     (void)lsm6dsv16x_poll(&s_sample);
 
+    /* Per-robot mounting trim, before anything is published - mount.h. */
+    mount_correct_vec(s_sample.gyro);
+    mount_correct_vec(s_sample.acc);
+    if (s_sample.quat_valid) {
+        mount_correct_quat(s_sample.quat);
+    }
+
     uint8_t block[DXL_SENSOR_LEN];
     put_i16(&block[0], s_sample.gyro[0]);
     put_i16(&block[2], s_sample.gyro[1]);
@@ -293,6 +310,9 @@ void app_task(void)
     if (s_sample.quat_valid) {
         status |= DXL_STATUS_SFLP_READY;
     }
+#if MOUNT_CORR_ENABLED
+    status |= DXL_STATUS_MOUNT_CORR;
+#endif
     if (s_sample.fifo_overrun) {
         status |= DXL_STATUS_FIFO_OVERRUN;
         s_sample.fifo_overrun = false; /* sticky until reported, then cleared */

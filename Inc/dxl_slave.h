@@ -44,7 +44,7 @@
 #define DXL_MODEL_NUMBER 0xC011u
 
 /** Bumped when the layout of the block at 124 changes. */
-#define DXL_FIRMWARE_VERSION 6u
+#define DXL_FIRMWARE_VERSION 7u
 
 /** Start and length of the sensor block. */
 #define DXL_SENSOR_ADDR 124u
@@ -58,6 +58,10 @@
 #define DXL_STATUS_SFLP_READY   0x02u /* at least one quaternion has arrived */
 #define DXL_STATUS_FIFO_OVERRUN 0x04u /* FIFO overran since the last publish */
 #define DXL_STATUS_SPI_ERROR    0x08u /* an SPI transfer timed out           */
+#define DXL_STATUS_MOUNT_CORR   0x10u /* a mounting correction is applied    */
+
+/** Where the mounting correction quaternion is served: four i16, w x y z, x10000. */
+#define DXL_MOUNT_ADDR 32u
 
 /**
  * Bring USART1 up on the bus and start serving. How the line is shared is the
@@ -77,6 +81,9 @@ void dxl_slave_init(void);
  *               half of one sample and half of the next.
  */
 void dxl_slave_publish(const uint8_t *block);
+
+/** Write @p len bytes of static table content at @p addr (diagnostics, identity). */
+void dxl_slave_set_static(uint16_t addr, const uint8_t *data, uint16_t len);
 
 /** Status packets sent since boot. Handy on a scope-less bench. */
 uint32_t dxl_slave_replies(void);
