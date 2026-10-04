@@ -1,6 +1,6 @@
 /**
  * @file    board.h
- * @brief   Pin map for the microduck `imu_to_dxl` board, per revision.
+ * @brief   Pin map for the microduck IMU board, per revision.
  *
  * Two revisions exist. Select with BOARD_REV, either here or with
  * -DBOARD_REV=n in the build settings. Everything in the .c files is written
@@ -24,7 +24,7 @@
  * | 13  | PA8         | LED       | TIM14_CH1. D2 anode on +3.3V: LOW = lit     |
  * | 16  | PA13        | SWDIO     | TC2030 pin 2                                |
  * | 17  | PA14/BOOT0  | SWCLK     | TC2030 pin 4, 10k pull-down on BOOT0        |
- * | 18  | PB6         | DATA_TX   | Dynamixel data, J2/J3 pin 3, direct         |
+ * | 18  | PB6         | DATA_TX   | servo bus data, J2/J3 pin 3, direct         |
  *
  * DATA_TX runs from PB6 straight to the connector - no transceiver, no
  * direction pin. USART1 runs single-wire half-duplex (HDSEL) and the firmware
@@ -91,7 +91,12 @@ uint32_t board_millis(void);
 #define IMU_MISO_PIN     (1u << 6)
 #define IMU_MOSI_PIN     (1u << 7)
 
-/* ── Dynamixel bus, TX side (both revisions) ─────────────────────────────── */
+/* ── Servo bus, TX side (both revisions) ─────────────────────────────────── */
+
+/* The DXL_* names are the schematic's: the nets really are called DXL_DATA and
+ * DXL_DIR on the PCB, and the copper does not care that what rides them is now
+ * FT-SCS rather than Dynamixel. Renaming them here would only make board.h
+ * disagree with the board. The protocol lives in ft_slave.c. */
 
 #define DXL_PORT         GPIOB
 #define DXL_TX_PIN_NUM   6u

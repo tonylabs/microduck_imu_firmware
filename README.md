@@ -1,68 +1,76 @@
-# microduck IMU firmware (`imu_to_dxl` v2)
+# microduck IMU firmware (`imu_to_ft` v10)
 
 Firmware for the STM32C011F6U6TR on the microduck IMU board: it reads an
-LSM6DSV16XTR over SPI and serves the result on the Dynamixel servo bus as a
-Protocol 2.0 device at ID 200.
+LSM6DSV16XTR over SPI and serves the result on the servo bus as a **Feetech
+FT-SCS** device at ID 200.
+
+> **v10 changed the protocol.** Up to v9 this board was a Dynamixel Protocol
+> 2.0 device serving its block at address 124, because the servos were XL330s.
+> They are now **FEETECH HD1910**, which speak FT-SCS, so the board does too.
+> What moved: the wire format, the address of the sensor block (124 -> **56**),
+> the baud rate *code* (3 -> **0**; the rate itself is still 1 Mbps), and where
+> the identity registers live. What did not move: the ID (200), the bus speed,
+> the 20-byte block layout, the pinout, and every line of the sensor path.
 
 ---
 
 ## How the Radxa ZERO 3W actually gets IMU data
 
-**It never talks to the LSM6DSV16X.** There is no I²C or SPI link between the
+**It never talks to the LSM6DSV16X.** There is no I2C or SPI link between the
 SBC and the sensor. The path is:
 
 ```
-Radxa ZERO 3W  ──/dev/ttyS2, Dynamixel 2.0, 1 Mbps──┬── ID 200  this board ──SPI──> LSM6DSV16XTR
-   robotd                                            ├── ID  ..  XL330 servo
-   duck-control::bus::DynamixelIo                    └── ... 15 servos total
+Radxa ZERO 3W  --/dev/ttyS2, FT-SCS, 1 Mbps--+-- ID 200  this board --SPI--> LSM6DSV16XTR
+   robotd                                    +-- ID  ..  HD1910 servo
+                                             +-- ... 15 servos total
 ```
 
 Per control tick (50 Hz) the host issues **one** `SYNC_READ` covering this board
-and all fifteen servos, at **address 124, length 12**. That address is not
-arbitrary: on an XL330 it is the start of `present_pwm` / `present_current` /
-`present_velocity` / `present_position`, and 12 bytes covers all four — so the
-IMU can ride the same transaction instead of being a separate poll. This board
-is listed **first** in the ID list, so it answers before the servo burst.
+and all fifteen servos, at **address 56, length 12**. That address is not
+arbitrary: on an HD1910 it is the start of `present_position` /
+`present_speed` / `present_load` / `present_voltage` / `present_temperature`,
+and 12 bytes covers the lot - so the IMU can ride the same transaction instead
+of being a separate poll. This board is listed **first** in the ID list, so it
+answers before the servo burst.
 
-Source of truth on the host side:
+Address 56 is to FT-SCS exactly what 124 was to Protocol 2.0: the first
+feedback register, and the one the per-tick read already has to start at.
 
-| What | Where |
-|---|---|
-| ID 200, 1 Mbps | `microduck/duck-control/src/model.rs` — `IMU_DXL_ID`, `BAUD_RATE` |
-| addr 124, len 12, IMU first in the list | `microduck/duck-control/src/bus.rs` |
-| block layout and decoding | `microduck/duck-control/src/imu.rs` |
+Source of truth for the protocol: `rust_servocom` -
+`src/feetech_protocol/feetech.rs` for the framing and the checksum (its unit
+tests are the vectors this firmware is checked against), `docs/FEETECH.md` for
+the memory table, `src/servo/feetech/hd1910.rs` for the servos' side of it.
 
 The host does no sensor fusion. The LSM6DSV16X's **SFLP** (sensor fusion
 low-power) block produces a game-rotation quaternion and estimates its own gyro
-bias; `SflpDecoder` only rotates it into the trunk frame, derives gravity, and
-runs a 3-sample median for spike rejection.
+bias; the host only rotates it into the trunk frame, derives gravity, and runs
+a 3-sample median for spike rejection.
 
 ### The 12 bytes the tick consumes
 
 | bytes | contents |
 |---|---|
-| 0..6 | gyro x/y/z, `i16` LE raw counts, ±500 dps (17.5 mdps/LSB) |
+| 0..6 | gyro x/y/z, `i16` LE raw counts, +/-500 dps (17.5 mdps/LSB) |
 | 6..12 | SFLP game rotation vector x/y/z as IEEE binary16 |
 
-`w` is **not** transmitted — the host reconstructs it as `√(1 − x² − y² − z²)`.
-All-zero quaternion bytes mean *SFLP has not written its table yet*, and the
-host holds its last good value rather than snapping to identity (snapping would
-tell fall detection an unknown-orientation robot is upright). This firmware
-therefore publishes zeros until the first quaternion actually arrives, roughly
-0.7 s after power-up.
+`w` is **not** transmitted - the host reconstructs it as
+`sqrt(1 - x^2 - y^2 - z^2)`. All-zero quaternion bytes mean *SFLP has not
+written its table yet*, and the host should hold its last good value rather
+than snapping to identity (snapping would tell fall detection an
+unknown-orientation robot is upright). This firmware therefore publishes zeros
+until the first quaternion actually arrives, roughly 0.7 s after power-up.
 
-`duck-control` also watches for a block identical to its predecessor and warns
-after 25 consecutive repeats — "the read succeeded but the board handed back the
-same sample". The byte-18 sample counter in the full block below makes that
-fault unambiguous.
+A block identical to its predecessor means "the read succeeded but the board
+handed back the same sample". The byte-18 sample counter in the full block
+below makes that fault unambiguous.
 
-### The full 20-byte block this firmware serves at 124
+### The full 20-byte block this firmware serves at 56
 
 | offset | bytes | contents |
 |---|---|---|
-| 0 | 6 | gyro x/y/z, `i16` LE, ±500 dps |
+| 0 | 6 | gyro x/y/z, `i16` LE, +/-500 dps |
 | 6 | 6 | SFLP quaternion x/y/z, binary16 LE |
-| 12 | 6 | accelerometer x/y/z, `i16` LE, ±4 g (0.122 mg/LSB) |
+| 12 | 6 | accelerometer x/y/z, `i16` LE, +/-4 g (0.122 mg/LSB) |
 | 18 | 1 | sample counter, wraps at 256 |
 | 19 | 1 | status flags |
 
@@ -70,23 +78,116 @@ Status flags: `0x01` IMU present (WHO_AM_I matched), `0x02` SFLP ready,
 `0x04` FIFO overran since last publish, `0x08` SPI transfer timed out,
 `0x10` a mounting correction is applied (v7, below).
 
-Also served, for bus scans and diagnostics:
+### The rest of the register file
+
+Addresses **0-8 are the real FT-SCS header**, because that is what a bus scan
+reads and it costs nine bytes to be scannable. Everything above that is this
+board's own: an address that means `min_angle_limit` or `present_speed` on an
+HD1910 means whatever this table says it means here. **This is not a servo
+control table** and nothing tries to make it look like one.
 
 | addr | size | value |
 |---|---|---|
-| 0 | 2 | model number `0xC011` |
-| 2 | 1 | firmware version |
-| 3 | 1 | ID (200) |
-| 4 | 1 | baud rate code (3 = 1 Mbps) |
-| 5 | 1 | return delay time (0) |
-| 32 | 8 | mounting correction in force (v7): the sensor-frame quaternion w, x, y, z as four `i16` × 10000. `(10000, 0, 0, 0)` means none |
-| 8 | 22 | diagnostic counters (v4), eleven `u16` LE, wrapping, never cleared — take differences: requests that reached the parser, CRC failures, mid-packet gap resets, receiver FE/NE/ORE, `SYNC_READ`s answered, replies framed, replies completed (TC), largest mid-packet gap tolerated (µs, v5), the gap that caused the last reset and the byte it struck at, receiver overruns (v6). `read 200 8 22` after a run says where a request the host never got an answer to actually died |
+| 0 | 1 | firmware major version (10) |
+| 1 | 1 | firmware minor version |
+| 2 | 1 | `END` = 0, i.e. little-endian, as every FT-SCS device |
+| 3 | 2 | model, `u16` LE = `0xC011` - where `servocom`'s scanner looks |
+| 5 | 1 | ID (200) |
+| 6 | 1 | baud rate code - **0 = 1 Mbps** in Feetech's numbering |
+| 7 | 1 | return delay (0) |
+| 8 | 1 | response status level (1 = answer every instruction) |
+| 16 | 22 | diagnostic counters (v4), eleven `u16` LE, wrapping, never cleared - take differences: requests that reached the parser, checksum failures, mid-packet gap resets, receiver FE/NE, `SYNC_READ`s answered, replies framed, replies completed (TC), largest mid-packet gap tolerated (us, v5), the gap that caused the last reset and the byte it struck at, receiver overruns (v6). `read 200 16 22` after a run says where a request the host never got an answer to actually died |
+| 40 | 8 | mounting correction in force (v7): the sensor-frame quaternion w, x, y, z as four `i16` x 10000. `(10000, 0, 0, 0)` means none |
+| 56 | 20 | the sensor block above |
 
-Supported instructions: `PING` (0x01), `READ` (0x02), `WRITE` (0x03, accepted
-and ignored — nothing is writable), `SYNC_READ` (0x82).
+Gaps read as zero, as does anything past the end of the table - see *Reads
+never fail* below.
 
-`duck-control::check_registers` asserts EEPROM registers on the **servos only**,
-never on ID 200, so this board does not have to emulate the XL330 control table.
+`0xC011` is far outside the range any real Feetech servo reports (the highest
+registered in `servocom` is the SM40BL at 10248), so a scan cannot mistake this
+board for a servo. It is also what this board reported as its Dynamixel model
+number, so a board stays identifiable across the protocol change. `servocom`'s
+`ServoKind` has no entry for it, so `scan --protocol feetech` prints *"Found
+motor with id 200 with ... (raw: 49169)"* - correct, just unnamed. Adding it to
+`src/servo/mod.rs` would give it a name.
+
+---
+
+## The wire format, and what it costs
+
+FT-SCS. Both directions are
+
+```
+FF FF  ID  LEN  (INST | ERR)  PARAM...  CHK
+```
+
+`LEN` counts everything after itself including `CHK`, so `LEN = nparams + 2`.
+`CHK` is the bitwise complement of the 8-bit sum of `ID`, `LEN`, the
+instruction-or-error byte and the parameters; the two header bytes are not
+summed. Instruction packets carry an instruction byte in that slot, status
+packets carry an error byte.
+
+Three differences from Protocol 2.0 matter, and all three show up in the code:
+
+* **There is no byte stuffing.** `FF FF` can and does appear inside a payload -
+  a gyro reading of -1 is two of them - so the header is *not* a reliable
+  resynchronisation point. The inter-byte gap rule is what recovers the stream,
+  and under FT-SCS it is the only thing that can. (Under Protocol 2.0 it was
+  merely the better of two options.) A run of three or more `FF` is handled by
+  staying in the ID state: no device has ID 255, so the header must have been
+  the *last* two.
+* **`LEN` is one byte**, so a packet is at most 259 bytes and a read at most
+  253. The buffers are sized for the protocol maximum rather than for what this
+  board expects, so no legal request can overrun them or be answered short.
+* **The checksum is an 8-bit sum**, not a CRC-16. It catches a mangled byte but
+  not every transposition - nothing to be done about that, it is what the
+  servos on the same wire use. The upside is that the 512-byte CRC table v4
+  needed to keep the ISR affordable is gone; a wrapping sum is a few cycles a
+  byte.
+
+Supported instructions: `PING` (0x01), `READ` (0x02), `WRITE` (0x03),
+`REG_WRITE` (0x04), `ACTION` (0x05), `RESET` (0x06), `REBOOT` (0x08),
+`SYNC_READ` (0x82). Everything that would change state is acknowledged and
+ignored - identity is compiled in and the sensor block is an output - rather
+than refused, because on FT-SCS the only way to refuse is silence, and silence
+is indistinguishable from a dead board. `SYNC_WRITE` (0x83) is dropped at the
+instruction byte, before it costs a checksum: on this bus it is the host's
+per-tick broadcast of goal positions, and it is never ours.
+
+**Broadcast `PING` is deliberately unanswered.** A Feetech bus is scanned by
+pinging each ID in turn - `servocom`'s scanner does exactly that - so answering
+the broadcast buys nothing and would put this board's reply on the wire at the
+same moment as fifteen servos', making the scan garbage for all sixteen.
+
+### Reads never fail
+
+FT-SCS has no way to say *"that address does not exist"*: the error byte is
+eight hardware-fault bits and nothing else. So a read of an address this board
+does not have returns **zeros, of exactly the length asked for**, and a read
+running off the end of the table is zero-filled rather than truncated.
+
+That is not laziness, it is the only safe answer on a shared bus. The host
+reads status packets back in ID order; a missing or short reply does not cost
+one device's data, it costs every device queued behind us too. A reply of the
+right length always keeps the bus in step. The Feetech memory table has
+`Undefined` rows of its own, so zero is also what a real servo does here.
+
+The one request that gets no answer at all is a read longer than 253 bytes,
+which `LEN` cannot describe - there is no correctly framed packet to send.
+
+### The error byte
+
+Every FT-SCS status packet carries one, and a Feetech-aware host decodes it
+without being told anything about this board. So when the IMU is not answering
+- a bad `WHO_AM_I` at boot, or SPI timing out since - this firmware sets
+**bit 1, the magnetic-encoder bit**: *"the position sensor is not answering"*,
+which is the closest true statement FT-SCS can make about an IMU that is not
+answering either. A dead board therefore shows up as an error in generic
+tooling, with no IMU-specific host code.
+
+The authoritative answer is still byte 19 of the sensor block. Set
+`FT_ERR_MIRRORS_FAULTS` to 0 in `ft_slave.h` for a board that must never look
+faulted to generic tooling.
 
 ---
 
@@ -166,7 +267,7 @@ driven — for the few microseconds until the USART wakes up.
 | 9–12 | PA4–PA7 | SPI | as Rev 2 |
 | 13 | **PA8** | LED | D2 anode on +3.3V through R2 1 k — **LOW = lit**. AF13 = TIM14_CH1 |
 | 16, 17 | PA13, PA14 | SWD | as Rev 2 |
-| 18 | **PB6** | DATA_TX | Dynamixel data, J2/J3 pin 3, **direct** |
+| 18 | **PB6** | DATA_TX | servo bus data, J2/J3 pin 3, **direct** |
 
 Unconnected: PA1, PA2, PA3, PA9/PA11, PA10/PA12, PB7, PC14, PC15.
 
@@ -207,7 +308,7 @@ So the entire bus-rate error budget is HSI48 trim. From DS13866 Rev 5, Table 40:
 | drift, T_A = −40 to 125 °C | −2.5 % / +2 % |
 
 A 1 Mbps 8N1 link tolerates roughly ±2 % end to end, and everything else on the
-bus — the XL330s, a U2D2 — is crystal-clocked, so nearly all of that budget is
+bus — the HD1910s, a USB-TTL adapter — is crystal-clocked, so nearly all of that budget is
 ours to spend. ±1 % across 0–85 °C leaves real margin; the −40 °C corner is
 where it would get tight, which is not where this robot lives. If a particular
 board ever does turn out to be marginal, `HSITRIM` in `RCC->ICSCR` is the knob,
@@ -255,7 +356,7 @@ whose peripherals are all configured by hand it costs little.
 | `Inc/board.h` | pin map per board revision, transcribed from the schematics; `BOARD_REV` lives here |
 | `Src/main.c` | clock, SysTick, main loop |
 | `Src/lsm6dsv16x.c` | SPI1 at register level; chip config; FIFO drain for SFLP |
-| `Src/dxl_slave.c` | Protocol 2.0 slave on USART1, all in the ISR; hardware DE (Rev 2) or HDSEL + open-drain (Rev 1) |
+| `Src/ft_slave.c` | FT-SCS slave on USART1, all in the ISR; hardware DE (Rev 2) or HDSEL + open-drain (Rev 1) |
 | `Src/app.c` | poll loop, sensor block assembly, LED |
 | `Src/mount.c`, `Inc/mount.h` | per-robot mounting correction (v7): a fixed sensor-frame rotation applied to gyro, accel and the SFLP quaternion before publishing, so a board mounted a few degrees off reads as mounted straight. The host has no trim for this; the constants and the measurement procedure are in `mount.h` |
 
@@ -290,9 +391,9 @@ period plus one poll period, 8.3 + 2 = ~10 ms, against a 20 ms tick. `robotd`
 already treats the observation as one full tick old by construction ("at 50 Hz
 the policy is trained on data of exactly this age"), so that fits with room.
 
-120 Hz also keeps `duck-control` from crying stale: at 2.4 IMU samples per tick
-every host read gets a fresh block, so the 25-repeat `STALE_RUN_WARN` cannot
-trip. An SFLP ODR of 15 or 30 Hz would trip it constantly.
+120 Hz also keeps a host-side stale-sample detector quiet: at 2.4 IMU samples
+per tick every host read gets a fresh block, so a run of identical blocks
+cannot build up. An SFLP ODR of 15 or 30 Hz would trip one constantly.
 
 * Poll: every 2 ms (500 Hz), four SPI transactions of ~20 µs each.
 * Bus: the whole protocol runs in `USART1_IRQHandler`, so a request is answered
@@ -328,69 +429,89 @@ trip. An SFLP ODR of 15 or 30 Hz would trip it constantly.
 
 ### What has and has not been verified
 
-Verified off-target:
+The protocol is checked by a **23-case round-trip test built from the shipping
+`Src/ft_slave.c`** (compiled with `-Dstatic=` so the parser, the framer and the
+table are reachable; requests go straight into `rx_byte()` and replies are read
+back out of `s_tx`, with the USART interrupt masked). It is built for the
+STM32C011 with the firmware's own compiler and flags, and run **both** under a
+Cortex-M0+ emulator and **on the board itself**, the results read out over SWD.
+All 23 pass in both places. What it covers:
 
-* **It builds and links** with the GCC 14.3 that ships with CubeIDE, clean under
-  `-Wall -Wextra` — no warnings from any of these sources.
+* **The checksum**, against all six packet vectors in `rust_servocom`'s own
+  `feetech.rs` unit tests - `ping(1)`, `read(1,0x2B,1)`, `write(10,24,[1])`,
+  `sync_read([11,12],30,2)` and two status packets - each also recomputed by an
+  independent implementation inside the test, so a shared bug cannot make one
+  pass.
+* **`PING`**: answered unicast with a payload-free status packet; silent on the
+  broadcast address and on someone else's ID.
+* **`READ`** of the identity header a scan uses: address 3 returns
+  `11 C0` (model `0xC011` little-endian), address 5 returns ID 200 and baud
+  code 0.
+* **The per-tick `SYNC_READ(56, 12)`** with this board first in the ID list,
+  byte for byte against a hand-computed frame - with a sensor block containing
+  `FF FF FD 00`, and an explicit check that those four bytes come back
+  **un-stuffed**. That is the one place a Protocol 2.0 habit would silently
+  corrupt an FT-SCS payload.
+* **`SYNC_READ` this board is not listed in**: silent.
+* **A wrong checksum**: silent.
+* **A read running off the end of the table**: right length, zero-filled.
+* **`WRITE`**: acknowledged, and the table is unchanged afterwards.
+* **A broadcast `SYNC_WRITE`**: dropped - and the `PING` immediately after it
+  is still parsed, which is the regression that matters, since dropping a
+  packet mid-stream is exactly how a parser loses the next one too.
+* **Four `0xFF` then a `PING`**: still parsed.
+* **The error byte** following the fault flag in both directions.
+
+Also verified off-target:
+
+* **It builds and links** with the GCC 14.3 that ships with CubeIDE, clean
+  under `-Wall -Wextra`, for both board revisions.
 
   | config | flash | RAM |
   |---|---|---|
-  | Debug (`-O0 -g3`) | 7 052 / 32 768 — 22 % | 3 540 / 6 144 — 58 % |
-  | Release (`-Os`) | 3 512 / 32 768 — **11 %** | same |
+  | Rev 2, Release (`-Os`) | 9 456 / 32 768 - 29 % | 3 796 / 6 144 - 62 % |
+  | Rev 1, Release (`-Os`) | 9 364 / 32 768 - 29 % | same |
+  | Rev 2, Debug (`-O0 -g3`) | 14 020 / 32 768 - 43 % | same |
 
-  RAM is 2 004 bytes of `.bss` plus the linker script's 0x200 heap and 0x400
-  stack.
-* **`USART1_IRQHandler` and `SysTick_Handler` override the weak defaults.**
-  Vector table offset `0xAC` holds `0x080011E9` and offset `0x3C` holds
-  `0x08000339` — the two handlers, not `Default_Handler`. Worth checking, since
-  both are placed by link-time override rather than by any config.
-* **The CRC** against both worked examples in the ROBOTIS Protocol 2.0
-  documentation (`89CA` and `0CA1`).
-* **The framing**, by transcribing it and round-tripping the exact `SYNC_READ`
-  the control loop issues — with a sensor block containing `FF FF FD`, which
-  exercises byte stuffing in both directions.
+  RAM is 2 260 bytes of `.bss` plus the linker script's 0x200 heap and 0x400
+  stack. `.bss` grew about 300 bytes over v9: the receive and transmit buffers
+  are now sized for the FT-SCS maximum rather than for the longest packet this
+  board expects.
 
-Verified **on hardware** (STLINK-V3MINIE over SWD, target at 3.27 V, device ID
-0x443):
+Verified **on hardware** (Rev 2 board, STLINK-V3MINIE over SWD, target at
+3.21 V, device ID 0x443), 2026-10-04:
 
-* Flashed and read back verified; the firmware runs, SysTick counts.
+* Flashed and read back verified; the firmware runs, SysTick counts past 21 s.
+* The FT-SCS header reads back exactly as intended: `fw 10.0`, `END 0`,
+  `model 0xC011`, `id 200`, `baud_code 0`, `delay 0`, `response level 1`.
 * `s_imu_present = 1` - the LSM6DSV16X answered `WHO_AM_I` over SPI1.
-* Status byte `0x03` = `IMU_PRESENT | SFLP_READY`, with `FIFO_OVERRUN` and
-  `SPI_ERROR` clear.
-* Accelerometer magnitude **0.9986 g** at rest. This is the load-bearing number:
-  it confirms the +/-4 g full scale and the 0.122 mg/LSB conversion together,
-  because only the right pair gives 1 g.
-* Gyroscope within 0.5 dps of zero on a stationary bench.
-* **Publish rate 500.45 Hz** measured against the 500 Hz schedule: 558 samples
-  in 1 115 ms of firmware time, +0.09 %. Measured again after the PWM heartbeat
-  was added, and the earlier figure without it was 499.1 Hz - a 0.27 % spread
-  against a measurement precision of about +/-0.36 % (one count of a byte-wide
-  counter at each end of the window). The fade is below the noise floor, which
-  is where the arithmetic says it should be: ~300 cycles every 4 ms is 0.16 %
-  of a 48 MHz core.
-* **Every published block differs from the one before it** across five
-  consecutive reads. This is the property `duck-control`'s frozen-IMU detector
-  keys on, so it will never false-trip.
-* Accelerometer magnitude across five reads: 0.9980 to 0.9991 g, a spread of
-  about 9 LSB. Gyro bias steady at -0.44 / 0.00 / +0.19 dps.
-* Uptime past three minutes with `IMU_PRESENT` still set and the counter
-  advancing - no hang, no drift.
-* **The LED PWM runs in hardware.** `TIM14` reads back `CR1 = 0x081`
-  (`ARPE|CEN`), `CCMR1 = 0x068` (PWM mode 1 with preload), `CCER = 0x003`
-  (`CC1E|CC1P`), `PSC = 47`, `ARR = 1000`; `CNT` advances between reads and
-  `CCR1` was caught at 342, part-way through a fade. `GPIOA->MODER` has PA8 in
-  alternate function with `AFRH = 0xD`, and PA13/PA14 are still `10` - SWD
-  intact.
-* SFLP quaternion non-zero and normalised, w = 0.99964, about 3 degrees off
-  level - consistent with a board lying on a desk.
+* Status byte `0x13` = `IMU_PRESENT | SFLP_READY | MOUNT_CORR`, with
+  `FIFO_OVERRUN` and `SPI_ERROR` clear. Error byte `0x00`.
+* Accelerometer magnitude **0.9988 / 1.0046 / 1.0051 g** across three reads.
+  This is the load-bearing number: it confirms the +/-4 g full scale and the
+  0.122 mg/LSB conversion together, because only the right pair gives 1 g.
+* Gyroscope within a few dps of zero on a stationary bench.
+* SFLP quaternion non-zero and normalised.
+* **Every published block differs from the one before it**, and the sample
+  counter advances (99 -> 171 -> 241), so a frozen-IMU detector will not
+  false-trip.
+* Diagnostic counters all zero, including `chk_fail`, `gap_reset` and
+  `line_err` - nothing on the wire, as expected with no master attached.
+* The mounting correction reads back at address 40 as
+  `(9941, 0, 1066, -191)`.
 
-All of the above was measured on a **Rev 1** board. Still unverified: **the
-Dynamixel bus itself**, on either revision. `dxl_slave_replies()` reads 0
-because nothing is polling - that needs the robot or a U2D2 on the bus
-connector. Everything upstream of the connector is proven on Rev 1; Rev 2 has
-so far only been built (`-Wall -Wextra` clean, 3 872 bytes at `-Os`) and needs
-the same bring-up pass - in particular that PA12 goes low around each status
-packet and nowhere else.
+Earlier revisions of this board also measured, on **Rev 1** hardware and still
+true of the sensor path, which v10 did not touch: publish rate 500.45 Hz
+against the 500 Hz schedule (+0.09 %); gyro bias steady at -0.44 / 0.00 /
++0.19 dps; uptime past three minutes with no hang or drift; the LED PWM running
+in hardware with SWD intact.
+
+Still unverified: **the bus itself.** `ft_slave_replies()` reads 0 because
+nothing is polling - that needs the robot, or a USB-TTL adapter on the bus
+connector driving FT-SCS at 1 Mbps. Everything on this board up to the
+connector is now proven, and the framing it would put on the wire is proven
+byte for byte; what has not been watched is a real master getting an answer,
+and PA12 going low around each status packet and nowhere else.
 
 ### LED
 
@@ -410,7 +531,7 @@ be timed.
 
 Three details that matter more than they look:
 
-* **Not TIM3.** TIM3 is the microsecond clock the Dynamixel slave times its
+* **Not TIM3.** TIM3 is the microsecond clock the bus slave times its
   turnaround with, fixed at `ARR = 0xFFFF`; as a PWM period that is 15 Hz,
   i.e. visible flicker. On Rev 2 the LED pin only reaches TIM1, and TIM1 is an
   advanced timer: its outputs stay off until `BDTR.MOE` is set

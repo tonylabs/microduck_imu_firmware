@@ -4,7 +4,7 @@
  *
  * The board does two things and nothing else: keep a fresh sample from the
  * LSM6DSV16X, and answer the host's SYNC_READ. The second runs entirely in the
- * USART1 interrupt (see dxl_slave.c), so this loop only has to keep the shadow
+ * USART1 interrupt (see ft_slave.c), so this loop only has to keep the shadow
  * block current.
  *
  * The poll is paced rather than free-running. SFLP produces a quaternion at
@@ -19,7 +19,7 @@
 #include <string.h>
 
 #include "board.h"
-#include "dxl_slave.h"
+#include "ft_slave.h"
 #include "lsm6dsv16x.h"
 
 /** Poll period in milliseconds. */
@@ -203,7 +203,7 @@ void app_init(void)
     /* The bus comes up whatever the IMU did. A board that answers with a zero
      * block and IMU_PRESENT clear is diagnosable from the host; one that stays
      * silent looks the same as an unplugged connector. */
-    dxl_slave_init();
+    ft_slave_init();
 
     /* The mounting correction in force, so a host can read what this board is
      * doing to its samples rather than infer it. */
@@ -211,7 +211,7 @@ void app_init(void)
         int16_t c[4]; uint8_t raw[8];
         mount_correction_i16(c);
         for (int i = 0; i < 4; i++) { put_i16(&raw[i * 2], c[i]); }
-        dxl_slave_set_static(DXL_MOUNT_ADDR, raw, 8u);
+        ft_slave_set_static(FT_MOUNT_ADDR, raw, 8u);
     }
 
     s_next_poll = board_millis();
@@ -221,6 +221,7 @@ void app_init(void)
      * reporting a fault. */
     s_last_error_ms = s_next_poll - FAULT_HOLD_MS;
     s_fault_shown = !s_imu_present;
+    ft_slave_set_fault(s_fault_shown);
 }
 
 void app_task(void)
@@ -237,6 +238,11 @@ void app_task(void)
     if (fault != s_fault_shown) {
         s_fault_shown = fault;
         s_next_blink = now;
+        /* The same fact the LED is showing, in the error byte of every status
+         * packet. Driven from here rather than from the published block
+         * because the case that matters most - an IMU that never answered
+         * WHO_AM_I - is exactly the case where no block is ever published. */
+        ft_slave_set_fault(fault);
     }
 
     if ((int32_t)(now - s_next_blink) >= 0) {
@@ -287,7 +293,7 @@ void app_task(void)
         mount_correct_quat(quat);
     }
 
-    uint8_t block[DXL_SENSOR_LEN];
+    uint8_t block[FT_SENSOR_LEN];
     put_i16(&block[0], gyro[0]);
     put_i16(&block[2], gyro[1]);
     put_i16(&block[4], gyro[2]);
@@ -308,21 +314,21 @@ void app_task(void)
      * frozen; this makes the same fault unambiguous over the full 20. */
     block[18] = s_counter++;
 
-    uint8_t status = DXL_STATUS_IMU_PRESENT;
+    uint8_t status = FT_STATUS_IMU_PRESENT;
     if (s_sample.quat_valid) {
-        status |= DXL_STATUS_SFLP_READY;
+        status |= FT_STATUS_SFLP_READY;
     }
 #if MOUNT_CORR_ENABLED
-    status |= DXL_STATUS_MOUNT_CORR;
+    status |= FT_STATUS_MOUNT_CORR;
 #endif
     if (s_sample.fifo_overrun) {
-        status |= DXL_STATUS_FIFO_OVERRUN;
+        status |= FT_STATUS_FIFO_OVERRUN;
         s_sample.fifo_overrun = false; /* sticky until reported, then cleared */
     }
     if (s_sample.bus_error) {
-        status |= DXL_STATUS_SPI_ERROR;
+        status |= FT_STATUS_SPI_ERROR;
     }
     block[19] = status;
 
-    dxl_slave_publish(block);
+    ft_slave_publish(block);
 }

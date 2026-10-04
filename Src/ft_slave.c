@@ -1,13 +1,15 @@
 /**
- * @file    dxl_slave.c
- * @brief   Dynamixel Protocol 2.0 slave over USART1, half-duplex.
+ * @file    ft_slave.c
+ * @brief   Feetech FT-SCS slave over USART1, half-duplex.
  *
  * ## Owning one shared wire
  *
  * Sixteen devices share DATA and take turns. The protocol layer here is the
  * same on every board revision; what differs is how this MCU lets go of the
  * wire when it is not its turn, and that lives in line_drive() / line_release()
- * behind DXL_BUFFERED from board.h.
+ * behind DXL_BUFFERED from board.h. (The board.h names stay DXL_*: those are
+ * the net names on the schematic, and the copper does not care which protocol
+ * rides it.)
  *
  * **Rev 1, DXL_BUFFERED = 0.** PB6 runs straight to the connector, and
  * USART1_RX cannot be routed to it, so USART1 runs single-wire half-duplex
@@ -27,19 +29,44 @@
  * everything this board transmits is also received - RE is dropped for the
  * duration of a transmission, exactly as HDSEL requires on Rev 1.
  *
+ * ## The wire format
+ *
+ * FT-SCS, the Feetech protocol the HD1910 speaks. Both directions are
+ *
+ *     FF FF  ID  LEN  (INST | ERR)  PARAM...  CHK
+ *
+ * with LEN counting everything after itself including CHK - so LEN = nparams
+ * + 2 - and CHK the bitwise complement of the 8-bit sum of ID, LEN, the
+ * instruction-or-error byte and the parameters. The two header bytes are not
+ * summed. Instruction packets carry an instruction byte here; status packets
+ * carry an error byte.
+ *
+ * Three things follow from that, and all three cost code below:
+ *
+ * * **There is no byte stuffing.** FF FF can and does occur inside a payload
+ *   - a gyro reading of -1 is two of them - so the header is not a reliable
+ *   resynchronisation point. The inter-byte gap below is what recovers a
+ *   stream, not the header.
+ * * **LEN is one byte**, so a packet is at most 259 bytes and a read is at
+ *   most 253. The buffers are sized for the maximum rather than for what this
+ *   board expects, so no legal request can overrun them or be answered with
+ *   the wrong number of bytes.
+ * * **The checksum is eight bits.** It is a sum, not a CRC: it catches a
+ *   mangled byte but not every transposition. Nothing to be done about that -
+ *   it is what the servos on the same wire use.
+ *
  * ## Latency
  *
- * The whole protocol runs in the USART1 interrupt: by the time the last CRC
+ * The whole protocol runs in the USART1 interrupt: by the time the checksum
  * byte of a request has arrived the response is built and the first byte is in
- * TDR. return_delay_time is 0, matching what the host asserts of the servos.
+ * TDR. The return delay is 0.
  *
  * Packets addressed to someone else - every servo status packet on the bus,
- * about fifteen per tick - are dropped at the ID byte, before any CRC is
- * computed. Byte stuffing guarantees FF FF FD 00 never appears inside a
- * payload, so resynchronising on the header is safe.
+ * about fifteen per tick - are dropped at the ID byte, before the checksum is
+ * computed.
  */
 
-#include "dxl_slave.h"
+#include "ft_slave.h"
 
 #include <string.h>
 
@@ -64,31 +91,39 @@
 
 /* -- protocol constants --------------------------------------------------- */
 
-#define INST_PING      0x01u
-#define INST_READ      0x02u
-#define INST_WRITE     0x03u
-#define INST_SYNC_READ 0x82u
-#define INST_STATUS    0x55u
+#define INST_PING       0x01u
+#define INST_READ       0x02u
+#define INST_WRITE      0x03u
+#define INST_REG_WRITE  0x04u
+#define INST_ACTION     0x05u
+#define INST_RESET      0x06u
+#define INST_REBOOT     0x08u
+#define INST_SYNC_READ  0x82u
+#define INST_SYNC_WRITE 0x83u
 
-#define ERR_NONE          0x00u
-#define ERR_DATA_RANGE    0x04u
-#define ERR_DATA_LENGTH   0x05u
-#define ERR_INSTRUCTION   0x02u
+#define ERR_NONE 0x00u
 
-/** Longest request that is ours to buffer: a broadcast SYNC_WRITE of goal
- *  positions for fifteen servos is 88 bytes. 160 leaves room for a longer one
- *  without a second thought. */
-#define DXL_RX_MAX 160u
+/** Largest FT-SCS packet: FF FF ID LEN + 255 counted bytes. Sized for the
+ *  protocol rather than for the 24-byte SYNC_READ this board actually expects,
+ *  so no legal request can be truncated into a shorter one that happens to
+ *  checksum. */
+#define FT_RX_MAX 260u
 
-/** Header + id + len + inst + err + 20 params + worst-case stuffing + CRC. */
-#define DXL_TX_MAX 64u
+/** FF FF ID LEN ERR + 253 params + CHK. 253 is the longest payload LEN can
+ *  describe, so every read a host can legally ask for is answerable with a
+ *  correctly framed packet. */
+#define FT_TX_MAX 259u
+
+/** Longest payload a status packet can carry, from LEN being one byte. */
+#define FT_PARAMS_MAX 253u
 
 /* -- state ---------------------------------------------------------------- */
 
-static volatile uint8_t  s_table[DXL_TABLE_SIZE];
+static volatile uint8_t  s_table[FT_TABLE_SIZE];
 static volatile uint32_t s_replies;
+static volatile uint8_t  s_err; /* error byte sent with every status packet */
 
-static uint8_t  s_rx[DXL_RX_MAX];
+static uint8_t  s_rx[FT_RX_MAX];
 static uint16_t s_rx_len;     /* LEN field of the packet being received    */
 static uint16_t s_rx_pos;     /* bytes of the LEN-counted body received    */
 static uint8_t  s_state;
@@ -102,51 +137,56 @@ static uint16_t s_last_rx_us; /* TIM3 stamp of the previous byte           */
  *  and costs a second transaction as well as the one that was lost, which on
  *  this bus is a whole missed control tick.
  *
- *  Resynchronising on the header instead would be tempting, since byte stuffing
- *  keeps FF FF FD 00 out of any payload - but not out of the two CRC bytes,
- *  which are not stuffed, so a packet whose CRC happened to be 00 FD after two
- *  FF payload bytes would be thrown away. A gap cannot be faked that way. */
+ *  Under FT-SCS this is not merely the better option, it is the only one.
+ *  Protocol 2.0 could resynchronise on its four-byte header because byte
+ *  stuffing kept that sequence out of payloads; FF FF is not reserved in any
+ *  way here and turns up inside ordinary sensor data, so a parser that trusts
+ *  the header will happily start a packet in the middle of one. A gap cannot
+ *  be faked that way. */
 #define RX_IDLE_RESET_US 2000u
 
-/* 2 ms, not the 100 us it was. The host's UART loads its transmit FIFO in
+/* 2 ms, not the 100 us it once was. The host's UART loads its transmit FIFO in
  * chunks and the line idles until an interrupt refills it, and on the Radxa
  * that interrupt is routinely 100-300 us late: measured with the v4 counters,
  * the 100 us rule abandoned 9 of 300 fifteen-byte requests and 26 of 300
- * thirty-byte ones - every one of them clean, no CRC or line error, just a
- * pause in the middle. A truncated packet is still abandoned long before the
+ * thirty-byte ones - every one of them clean, no checksum or line error, just
+ * a pause in the middle. A truncated packet is still abandoned long before the
  * next request, which is a control tick (20 ms) away. */
 
 /* -- diagnostic counters ---------------------------------------------------
  *
- * Served in the control table at DXL_DIAG_ADDR, u16 little-endian each, so a
+ * Served in the control table at FT_DIAG_ADDR, u16 little-endian each, so a
  * host can read them over the bus and see where a request it never got an
  * answer to actually died: never assembled (bytes lost - compare `ours` to
- * what was sent), assembled but corrupt (`crc_fail`), a gap mid-packet
+ * what was sent), assembled but corrupt (`chk_fail`), a gap mid-packet
  * (`gap_reset`), the receiver flagging framing/noise/overrun (`line_err`),
  * served but the reply never completed (`served` vs `tx_done`). Wrap at 65536
  * and are never cleared; the host takes differences. */
 enum {
     DIAG_OURS = 0,   /* headers with our ID or broadcast, reached packet_complete */
-    DIAG_CRC_FAIL,   /* ... and failed CRC */
-    DIAG_GAP_RESET,  /* part-received packet abandoned on a >100 us gap */
-    DIAG_LINE_ERR,   /* FE / NE / ORE seen by the receiver */
+    DIAG_CHK_FAIL,   /* ... and failed the checksum */
+    DIAG_GAP_RESET,  /* part-received packet abandoned on a gap */
+    DIAG_LINE_ERR,   /* FE / NE seen by the receiver */
     DIAG_SERVED_SR,  /* SYNC_READ answered */
     DIAG_SERVED_RD,  /* every reply framed, SYNC_READ ones included */
     DIAG_TX_DONE,    /* replies whose last bit left the wire (TC) */
     DIAG_MAX_GAP_US, /* largest mid-packet inter-byte gap tolerated so far */
     DIAG_LAST_GAP_US,/* the gap that caused the most recent reset, us (saturates) */
     DIAG_LAST_GAP_AT,/* ... and how many bytes into the packet it struck */
-    DIAG_OVERRUN,    /* receiver overruns (ORE), now that they are reported */
+    DIAG_OVERRUN,    /* receiver overruns (ORE) */
     DIAG_COUNT
 };
-#define DXL_DIAG_ADDR 8u
+
+/** Not 8: on FT-SCS address 8 is the response status level, part of the
+ *  header every scanner reads. The counters start above the whole of it. */
+#define FT_DIAG_ADDR 16u
 
 static uint16_t s_diag[DIAG_COUNT];
 
 static inline void diag_store(uint8_t which)
 {
-    s_table[DXL_DIAG_ADDR + (which * 2u)]      = (uint8_t)(s_diag[which] & 0xFFu);
-    s_table[DXL_DIAG_ADDR + (which * 2u) + 1u] = (uint8_t)(s_diag[which] >> 8);
+    s_table[FT_DIAG_ADDR + (which * 2u)]      = (uint8_t)(s_diag[which] & 0xFFu);
+    s_table[FT_DIAG_ADDR + (which * 2u) + 1u] = (uint8_t)(s_diag[which] >> 8);
 }
 
 static inline void diag_bump(uint8_t which)
@@ -169,18 +209,15 @@ static inline void diag_max(uint8_t which, uint16_t v)
     }
 }
 
-static uint8_t  s_tx[DXL_TX_MAX];
+static uint8_t  s_tx[FT_TX_MAX];
 static uint16_t s_tx_len;
 static volatile uint16_t s_tx_pos;
 
 enum {
     S_FF1 = 0,
     S_FF2,
-    S_FD,
-    S_00,
     S_ID,
-    S_LEN_L,
-    S_LEN_H,
+    S_LEN,
     S_BODY
 };
 
@@ -210,63 +247,24 @@ static void delay_us(uint16_t us)
     }
 }
 
-/* -- CRC ------------------------------------------------------------------ */
+/* -- checksum ------------------------------------------------------------- */
 
 /*
- * CRC-16/IBM, polynomial 0x8005, initial value 0, not reflected - the Dynamixel
- * 2.0 CRC. Note it covers the packet *after* byte stuffing, header included.
+ * The FT-SCS checksum: ~(ID + LEN + INST/ERR + sum(PARAMS)), eight bits,
+ * wrapping. The two 0xFF header bytes are not included.
  *
- * Table-driven, and the table is the whole point. Every request is checked and
- * every reply is signed from inside USART1_IRQHandler, with the receiver
- * holding at most eight bytes - 80 us at 1 Mbps - behind it. Bitwise, the two
- * CRCs around one SYNC_READ cost about 50 us of deaf ISR on a 48 MHz M0+, and
- * the 88-byte SYNC_WRITE that precedes it on every tick cost 90 us on its own;
- * measured on the bus, the board answered about 85% of the host's SYNC_READs
- * and was silent for the rest. The table brings each CRC to about 2 us. 512
- * bytes of flash, on a part with 32 KB of which this firmware uses 4.
+ * The Dynamixel firmware this replaced needed a 512-byte table to get its
+ * CRC-16 down to a cost the ISR could afford; a byte-wide sum is a few cycles
+ * per byte and needs nothing. That is the one place where FT-SCS being the
+ * weaker protocol makes this board's job easier.
  */
-static const uint16_t s_crc_table[256] = {
-    0x0000u, 0x8005u, 0x800Fu, 0x000Au, 0x801Bu, 0x001Eu, 0x0014u, 0x8011u,
-    0x8033u, 0x0036u, 0x003Cu, 0x8039u, 0x0028u, 0x802Du, 0x8027u, 0x0022u,
-    0x8063u, 0x0066u, 0x006Cu, 0x8069u, 0x0078u, 0x807Du, 0x8077u, 0x0072u,
-    0x0050u, 0x8055u, 0x805Fu, 0x005Au, 0x804Bu, 0x004Eu, 0x0044u, 0x8041u,
-    0x80C3u, 0x00C6u, 0x00CCu, 0x80C9u, 0x00D8u, 0x80DDu, 0x80D7u, 0x00D2u,
-    0x00F0u, 0x80F5u, 0x80FFu, 0x00FAu, 0x80EBu, 0x00EEu, 0x00E4u, 0x80E1u,
-    0x00A0u, 0x80A5u, 0x80AFu, 0x00AAu, 0x80BBu, 0x00BEu, 0x00B4u, 0x80B1u,
-    0x8093u, 0x0096u, 0x009Cu, 0x8099u, 0x0088u, 0x808Du, 0x8087u, 0x0082u,
-    0x8183u, 0x0186u, 0x018Cu, 0x8189u, 0x0198u, 0x819Du, 0x8197u, 0x0192u,
-    0x01B0u, 0x81B5u, 0x81BFu, 0x01BAu, 0x81ABu, 0x01AEu, 0x01A4u, 0x81A1u,
-    0x01E0u, 0x81E5u, 0x81EFu, 0x01EAu, 0x81FBu, 0x01FEu, 0x01F4u, 0x81F1u,
-    0x81D3u, 0x01D6u, 0x01DCu, 0x81D9u, 0x01C8u, 0x81CDu, 0x81C7u, 0x01C2u,
-    0x0140u, 0x8145u, 0x814Fu, 0x014Au, 0x815Bu, 0x015Eu, 0x0154u, 0x8151u,
-    0x8173u, 0x0176u, 0x017Cu, 0x8179u, 0x0168u, 0x816Du, 0x8167u, 0x0162u,
-    0x8123u, 0x0126u, 0x012Cu, 0x8129u, 0x0138u, 0x813Du, 0x8137u, 0x0132u,
-    0x0110u, 0x8115u, 0x811Fu, 0x011Au, 0x810Bu, 0x010Eu, 0x0104u, 0x8101u,
-    0x8303u, 0x0306u, 0x030Cu, 0x8309u, 0x0318u, 0x831Du, 0x8317u, 0x0312u,
-    0x0330u, 0x8335u, 0x833Fu, 0x033Au, 0x832Bu, 0x032Eu, 0x0324u, 0x8321u,
-    0x0360u, 0x8365u, 0x836Fu, 0x036Au, 0x837Bu, 0x037Eu, 0x0374u, 0x8371u,
-    0x8353u, 0x0356u, 0x035Cu, 0x8359u, 0x0348u, 0x834Du, 0x8347u, 0x0342u,
-    0x03C0u, 0x83C5u, 0x83CFu, 0x03CAu, 0x83DBu, 0x03DEu, 0x03D4u, 0x83D1u,
-    0x83F3u, 0x03F6u, 0x03FCu, 0x83F9u, 0x03E8u, 0x83EDu, 0x83E7u, 0x03E2u,
-    0x83A3u, 0x03A6u, 0x03ACu, 0x83A9u, 0x03B8u, 0x83BDu, 0x83B7u, 0x03B2u,
-    0x0390u, 0x8395u, 0x839Fu, 0x039Au, 0x838Bu, 0x038Eu, 0x0384u, 0x8381u,
-    0x0280u, 0x8285u, 0x828Fu, 0x028Au, 0x829Bu, 0x029Eu, 0x0294u, 0x8291u,
-    0x82B3u, 0x02B6u, 0x02BCu, 0x82B9u, 0x02A8u, 0x82ADu, 0x82A7u, 0x02A2u,
-    0x82E3u, 0x02E6u, 0x02ECu, 0x82E9u, 0x02F8u, 0x82FDu, 0x82F7u, 0x02F2u,
-    0x02D0u, 0x82D5u, 0x82DFu, 0x02DAu, 0x82CBu, 0x02CEu, 0x02C4u, 0x82C1u,
-    0x8243u, 0x0246u, 0x024Cu, 0x8249u, 0x0258u, 0x825Du, 0x8257u, 0x0252u,
-    0x0270u, 0x8275u, 0x827Fu, 0x027Au, 0x826Bu, 0x026Eu, 0x0264u, 0x8261u,
-    0x0220u, 0x8225u, 0x822Fu, 0x022Au, 0x823Bu, 0x023Eu, 0x0234u, 0x8231u,
-    0x8213u, 0x0216u, 0x021Cu, 0x8219u, 0x0208u, 0x820Du, 0x8207u, 0x0202u,
-};
-
-static uint16_t dxl_crc(const uint8_t *data, uint16_t len)
+static uint8_t ft_checksum(const uint8_t *data, uint16_t len)
 {
-    uint16_t crc = 0u;
+    uint8_t sum = 0u;
     for (uint16_t i = 0u; i < len; i++) {
-        crc = (uint16_t)((crc << 8) ^ s_crc_table[((crc >> 8) ^ data[i]) & 0xFFu]);
+        sum = (uint8_t)(sum + data[i]);
     }
-    return crc;
+    return (uint8_t)~sum;
 }
 
 /* -- line direction ------------------------------------------------------- */
@@ -309,80 +307,90 @@ static void tx_start(void)
     s_replies++;
 }
 
-/**
- * Frame and queue a status packet.
+/*
+ * A status packet is framed in place in s_tx:
  *
- * @param err      error byte, 0 on success
- * @param params   payload after the error byte, may be NULL
- * @param nparams  length of @p params
+ *   index  0    1    2    3    4    5 ...        n
+ *          FF   FF   ID   LEN  ERR  params...    CHK
+ *
+ * tx_begin() lays down everything that does not depend on the payload,
+ * tx_finish() fills in LEN (which is only known once the payload is written),
+ * appends the checksum and hands the frame to the ISR. Splitting it this way
+ * lets serve_read() write its payload straight out of the volatile table and
+ * the zero fill past its end, without a second buffer to copy through.
  */
-static void respond(uint8_t err, const volatile uint8_t *params, uint16_t nparams)
+
+static void tx_begin(uint8_t err)
 {
-    uint16_t n = 0u;
+    s_tx[0] = 0xFFu;
+    s_tx[1] = 0xFFu;
+    s_tx[2] = (uint8_t)FT_ID;
+    /* s_tx[3] is LEN, written by tx_finish() */
+    s_tx[4] = err;
+}
 
-    s_tx[n++] = 0xFFu;
-    s_tx[n++] = 0xFFu;
-    s_tx[n++] = 0xFDu;
-    s_tx[n++] = 0x00u;
-    s_tx[n++] = (uint8_t)DXL_ID;
-    uint16_t len_at = n;
-    n += 2u; /* LEN is filled in once stuffing is known */
-
-    uint16_t body_at = n;
-    s_tx[n++] = INST_STATUS;
-    s_tx[n++] = err;
-
-    /* Byte stuffing: an FD following FF FF inside the payload gets a second FD
-     * so the sequence can never be mistaken for a header. */
-    uint8_t run = 0u; /* consecutive 0xFF seen, capped at 2 */
-    for (uint16_t i = 0u; i < nparams; i++) {
-        uint8_t b = params[i];
-        if (n >= DXL_TX_MAX - 3u) {
-            break;
-        }
-        s_tx[n++] = b;
-        if (b == 0xFFu) {
-            if (run < 2u) {
-                run++;
-            }
-        } else if (b == 0xFDu && run == 2u) {
-            s_tx[n++] = 0xFDu;
-            run = 0u;
-        } else {
-            run = 0u;
-        }
-    }
-
-    uint16_t len = (uint16_t)(n - body_at + 2u);
-    s_tx[len_at] = (uint8_t)(len & 0xFFu);
-    s_tx[len_at + 1u] = (uint8_t)(len >> 8);
-
-    uint16_t crc = dxl_crc(s_tx, n);
-    s_tx[n++] = (uint8_t)(crc & 0xFFu);
-    s_tx[n++] = (uint8_t)(crc >> 8);
-
-    s_tx_len = n;
+/** @param n  bytes written so far, i.e. 5 + the number of parameters. */
+static void tx_finish(uint16_t n)
+{
+    s_tx[3] = (uint8_t)(n - 3u); /* ERR + params + CHK */
+    s_tx[n] = ft_checksum(&s_tx[2], (uint16_t)(n - 2u));
+    s_tx_len = (uint16_t)(n + 1u);
     diag_bump(DIAG_SERVED_RD);
     tx_start();
+}
+
+/** The error byte this board reports. Zero unless the IMU has stopped
+ *  answering and FT_ERR_MIRRORS_FAULTS is on. */
+static inline uint8_t status_err(void)
+{
+    return s_err;
+}
+
+/** Frame and queue a status packet carrying a short fixed payload. */
+static void respond(const uint8_t *params, uint8_t nparams)
+{
+    tx_begin(status_err());
+    uint16_t n = 5u;
+    for (uint8_t i = 0u; i < nparams; i++) {
+        s_tx[n++] = params[i];
+    }
+    tx_finish(n);
 }
 
 /* -- request dispatch ----------------------------------------------------- */
 
 /** Status packet airtime for @p len payload bytes, in microseconds, plus a
- *  little slack. Header 4 + id + len 2 + inst + err + CRC 2 = 11 overhead
- *  bytes, ten bit times each at 1 Mbps. */
+ *  little slack. FF FF + id + len + err + chk = 6 overhead bytes, ten bit
+ *  times each at 1 Mbps. */
 static uint16_t slot_us(uint16_t len)
 {
-    return (uint16_t)(((11u + len) * 10u) + 20u);
+    return (uint16_t)(((6u + len) * 10u) + 20u);
 }
 
-static void serve_read(uint16_t addr, uint16_t len)
+/**
+ * Answer a READ or a SYNC_READ.
+ *
+ * Addresses past the end of the table read as zero rather than as an error.
+ * FT-SCS has no "that address does not exist" to report - the error byte is
+ * eight hardware fault bits and nothing else - and the alternative, staying
+ * silent, is worse than useless on a shared bus: the host is reading status
+ * packets back in ID order, so a missing reply does not cost one device's
+ * data, it costs every device queued behind us too. A reply of the right
+ * length always keeps the bus in step. The Feetech memory table has
+ * `Undefined` rows of its own, so zero is also what a real servo does here.
+ */
+static void serve_read(uint8_t addr, uint8_t len)
 {
-    if (len == 0u || addr >= DXL_TABLE_SIZE || (uint32_t)addr + len > DXL_TABLE_SIZE) {
-        respond(ERR_DATA_RANGE, NULL, 0u);
-        return;
+    if (len == 0u || len > FT_PARAMS_MAX) {
+        return; /* LEN could not describe the reply; nothing honest to send */
     }
-    respond(ERR_NONE, &s_table[addr], len);
+    tx_begin(status_err());
+    uint16_t n = 5u;
+    for (uint16_t i = 0u; i < len; i++) {
+        uint16_t a = (uint16_t)(addr + i);
+        s_tx[n++] = (a < FT_TABLE_SIZE) ? s_table[a] : 0u;
+    }
+    tx_finish(n);
 }
 
 static void handle_packet(uint8_t id, const uint8_t *body, uint16_t nbody)
@@ -395,54 +403,54 @@ static void handle_packet(uint8_t id, const uint8_t *body, uint16_t nbody)
     uint16_t np = (uint16_t)(nbody - 1u);
 
     switch (inst) {
-    case INST_PING: {
-        uint8_t info[3];
-        info[0] = (uint8_t)(DXL_MODEL_NUMBER & 0xFFu);
-        info[1] = (uint8_t)(DXL_MODEL_NUMBER >> 8);
-        info[2] = DXL_FIRMWARE_VERSION;
-        if (id == DXL_BROADCAST_ID) {
-            /* A bus scan pings the broadcast address and expects one answer per
-             * device, spaced by ID so they do not collide. */
-            delay_us((uint16_t)(DXL_ID * 3u));
+    case INST_PING:
+        /* Unicast only. A Feetech bus is scanned by pinging each ID in turn
+         * (servocom's scan does exactly that), so answering the broadcast buys
+         * nothing and would put this board's reply on the wire at the same
+         * moment as fifteen servos' - the scan would come back garbage for
+         * all sixteen. A Feetech ping carries no payload; the scanner reads
+         * the model at address 3 afterwards. */
+        if (id != FT_ID) {
+            break;
         }
-        respond(ERR_NONE, info, 3u);
+        respond(NULL, 0u);
         break;
-    }
 
     case INST_READ:
-        if (id != DXL_ID) {
+        if (id != FT_ID || np < 2u) {
             break;
         }
-        if (np < 4u) {
-            respond(ERR_DATA_LENGTH, NULL, 0u);
-            break;
-        }
-        serve_read((uint16_t)(p[0] | ((uint16_t)p[1] << 8)),
-                   (uint16_t)(p[2] | ((uint16_t)p[3] << 8)));
+        serve_read(p[0], p[1]);
         break;
 
     case INST_WRITE:
-        if (id != DXL_ID) {
+    case INST_REG_WRITE:
+    case INST_ACTION:
+    case INST_RESET:
+    case INST_REBOOT:
+        if (id != FT_ID) {
             break;
         }
         /* Nothing here is writable: identity is compiled in and the sensor
-         * block is an output. Acknowledged rather than refused so a tool that
+         * block is an output. Acknowledged rather than ignored so a tool that
          * writes a harmless register during a scan does not report the board
-         * as broken. */
-        respond(ERR_NONE, NULL, 0u);
+         * as missing - and because on FT-SCS silence is the only way to
+         * refuse, which is indistinguishable from a dead board. */
+        respond(NULL, 0u);
         break;
 
     case INST_SYNC_READ: {
-        if (np < 5u) {
+        /* addr, len, then one byte per device. */
+        if (np < 3u) {
             break;
         }
-        uint16_t addr = (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
-        uint16_t len = (uint16_t)(p[2] | ((uint16_t)p[3] << 8));
-        const uint8_t *ids = &p[4];
-        uint16_t nids = (uint16_t)(np - 4u);
+        uint8_t addr = p[0];
+        uint8_t len = p[1];
+        const uint8_t *ids = &p[2];
+        uint16_t nids = (uint16_t)(np - 2u);
 
         for (uint16_t i = 0u; i < nids; i++) {
-            if (ids[i] != DXL_ID) {
+            if (ids[i] != FT_ID) {
                 continue;
             }
             /* Devices answer in list order. The host puts this board at index 0
@@ -459,10 +467,10 @@ static void handle_packet(uint8_t id, const uint8_t *body, uint16_t nbody)
         break;
     }
 
+    case INST_SYNC_WRITE:
     default:
-        if (id == DXL_ID) {
-            respond(ERR_INSTRUCTION, NULL, 0u);
-        }
+        /* Not ours, or nothing we can refuse in a way FT-SCS can express.
+         * Either way: silence. */
         break;
     }
 }
@@ -471,43 +479,19 @@ static void handle_packet(uint8_t id, const uint8_t *body, uint16_t nbody)
 
 static void packet_complete(void)
 {
-    uint16_t total = (uint16_t)(7u + s_rx_len);
+    uint16_t total = (uint16_t)(4u + s_rx_len);
 
     diag_bump(DIAG_OURS);
-    uint16_t want = dxl_crc(s_rx, (uint16_t)(total - 2u));
-    uint16_t got = (uint16_t)(s_rx[total - 2u] | ((uint16_t)s_rx[total - 1u] << 8));
-    if (want != got) {
-        diag_bump(DIAG_CRC_FAIL);
+    /* Over ID, LEN, INST and the parameters - everything but the two header
+     * bytes and the checksum itself. */
+    uint8_t want = ft_checksum(&s_rx[2], (uint16_t)(total - 3u));
+    if (want != s_rx[total - 1u]) {
+        diag_bump(DIAG_CHK_FAIL);
         return;
     }
 
-    /* Un-stuff in place over the body, CRC excluded. */
-    uint8_t *body = &s_rx[7];
-    uint16_t raw = (uint16_t)(s_rx_len - 2u);
-    uint16_t out = 0u;
-    uint8_t run = 0u;
-    for (uint16_t i = 0u; i < raw; i++) {
-        uint8_t b = body[i];
-        if (b == 0xFDu && run == 2u) {
-            /* The inserted duplicate: keep one FD, drop the next byte. */
-            body[out++] = b;
-            if (i + 1u < raw && body[i + 1u] == 0xFDu) {
-                i++;
-            }
-            run = 0u;
-            continue;
-        }
-        body[out++] = b;
-        if (b == 0xFFu) {
-            if (run < 2u) {
-                run++;
-            }
-        } else {
-            run = 0u;
-        }
-    }
-
-    handle_packet(s_rx[4], body, out);
+    /* No un-stuffing: FT-SCS sends payload bytes exactly as they are. */
+    handle_packet(s_rx[2], &s_rx[4], (uint16_t)(s_rx_len - 1u));
 }
 
 static void rx_byte(uint8_t b)
@@ -518,7 +502,7 @@ static void rx_byte(uint8_t b)
         if (gap > RX_IDLE_RESET_US) {
             /* How far the abandoned packet had got: header bytes by state,
              * then the body count. */
-            uint16_t at = (s_state == S_BODY) ? (uint16_t)(7u + s_rx_pos) : (uint16_t)s_state;
+            uint16_t at = (s_state == S_BODY) ? (uint16_t)(4u + s_rx_pos) : (uint16_t)s_state;
             diag_set(DIAG_LAST_GAP_US, gap);
             diag_set(DIAG_LAST_GAP_AT, at);
             s_state = S_FF1;
@@ -537,49 +521,34 @@ static void rx_byte(uint8_t b)
         break;
 
     case S_FF2:
-        s_state = (b == 0xFFu) ? S_FD : S_FF1;
-        break;
-
-    case S_FD:
-        if (b == 0xFDu) {
-            s_state = S_00;
-        } else if (b != 0xFFu) {
-            s_state = S_FF1;
-        }
-        break;
-
-    case S_00:
-        if (b == 0x00u) {
-            s_state = S_ID;
-        } else {
-            s_state = (b == 0xFFu) ? S_FF2 : S_FF1;
-        }
+        s_state = (b == 0xFFu) ? S_ID : S_FF1;
         break;
 
     case S_ID:
+        /* A run of three or more 0xFF means the header was the *last* two of
+         * them, so stay here rather than reading an FF as an ID - no device
+         * has ID 255. */
+        if (b == 0xFFu) {
+            break;
+        }
         /* Everything else on this bus - fifteen servo status packets a tick -
-         * is dropped here, before it costs a CRC. */
-        if (b != DXL_ID && b != DXL_BROADCAST_ID) {
+         * is dropped here, before it costs a checksum. */
+        if (b != FT_ID && b != FT_BROADCAST_ID) {
             s_state = S_FF1;
             break;
         }
         s_rx[0] = 0xFFu;
         s_rx[1] = 0xFFu;
-        s_rx[2] = 0xFDu;
-        s_rx[3] = 0x00u;
-        s_rx[4] = b;
-        s_state = S_LEN_L;
+        s_rx[2] = b;
+        s_state = S_LEN;
         break;
 
-    case S_LEN_L:
-        s_rx[5] = b;
-        s_state = S_LEN_H;
-        break;
-
-    case S_LEN_H:
-        s_rx[6] = b;
-        s_rx_len = (uint16_t)(s_rx[5] | ((uint16_t)b << 8));
-        if (s_rx_len < 3u || s_rx_len > (DXL_RX_MAX - 7u)) {
+    case S_LEN:
+        /* LEN counts the instruction, the parameters and the checksum, so the
+         * shortest legal packet (a PING) has LEN 2. */
+        s_rx[3] = b;
+        s_rx_len = b;
+        if (s_rx_len < 2u || s_rx_len > (FT_RX_MAX - 4u)) {
             s_state = S_FF1;
             break;
         }
@@ -589,18 +558,15 @@ static void rx_byte(uint8_t b)
 
     case S_BODY:
         /* The first body byte is the instruction. A broadcast that is not a
-         * PING or a SYNC_READ is nobody's business here - it is the host's
-         * 88-byte SYNC_WRITE of goal positions, once a tick - so it is dropped
-         * now rather than buffered, CRC-checked and then ignored. Buffering
-         * it cost the receiver the ~90 us the CRC took, which is exactly the
-         * moment the next SYNC_READ starts arriving after a tick the host had
-         * to skip. */
-        if (s_rx_pos == 0u && s_rx[4] == DXL_BROADCAST_ID
-            && b != INST_PING && b != INST_SYNC_READ) {
+         * SYNC_READ is nobody's business here - it is the host's SYNC_WRITE of
+         * goal positions, once a tick - so it is dropped now rather than
+         * buffered, checksummed and then ignored. (A broadcast PING is not
+         * answered either; see handle_packet.) */
+        if (s_rx_pos == 0u && s_rx[2] == FT_BROADCAST_ID && b != INST_SYNC_READ) {
             s_state = S_FF1;
             break;
         }
-        s_rx[7u + s_rx_pos] = b;
+        s_rx[4u + s_rx_pos] = b;
         s_rx_pos++;
         if (s_rx_pos >= s_rx_len) {
             s_state = S_FF1;
@@ -667,9 +633,9 @@ void USART1_IRQHandler(void)
 /*
  * GPIO comes up in two steps around the USART, not one before it.
  *
- * dxl_gpio_prepare() sets everything about the pins except their mode - AF
+ * ft_gpio_prepare() sets everything about the pins except their mode - AF
  * number, pull, speed, output type - while they are still the high-impedance
- * inputs reset left them as. dxl_gpio_connect() then switches them to
+ * inputs reset left them as. ft_gpio_connect() then switches them to
  * alternate function, and is only called once USART1 is clocked, configured
  * and enabled. Put into AF mode earlier, a pin is driven by a peripheral that
  * does not exist yet, and the level it gets is whatever the unclocked mux
@@ -682,7 +648,7 @@ void USART1_IRQHandler(void)
  * pull-up holds DATA high through PB6's, so the board is silent by default.
  */
 
-static void dxl_gpio_prepare(void)
+static void ft_gpio_prepare(void)
 {
     RCC->IOPENR |= RCC_IOPENR_GPIOBEN;
 
@@ -720,7 +686,7 @@ static void dxl_gpio_prepare(void)
 #endif
 }
 
-static void dxl_gpio_connect(void)
+static void ft_gpio_connect(void)
 {
 #if DXL_BUFFERED
     /* DE first, then TX. With DEM|DEP already set and the transmitter idle,
@@ -733,28 +699,32 @@ static void dxl_gpio_connect(void)
                     | (2u << (DXL_TX_PIN_NUM * 2));
 }
 
-void dxl_slave_init(void)
+void ft_slave_init(void)
 {
     memset((void *)s_table, 0, sizeof(s_table));
-    s_table[0] = (uint8_t)(DXL_MODEL_NUMBER & 0xFFu);
-    s_table[1] = (uint8_t)(DXL_MODEL_NUMBER >> 8);
-    s_table[2] = DXL_FIRMWARE_VERSION;
-    s_table[3] = (uint8_t)DXL_ID;
-    s_table[4] = 3u; /* baud rate code 3 = 1 Mbps, matching the servos */
-    s_table[5] = 0u; /* return delay time */
+    /* The FT-SCS header, at the addresses the protocol fixes. A scan pings an
+     * ID and then reads two bytes at 3, so those two are what decide whether
+     * this board shows up as itself or as an unknown. */
+    s_table[0] = FT_FIRMWARE_VERSION;
+    s_table[1] = FT_FIRMWARE_MINOR;
+    s_table[2] = 0u; /* END = 0: little-endian, like every FT-SCS device */
+    s_table[3] = (uint8_t)(FT_MODEL_NUMBER & 0xFFu);
+    s_table[4] = (uint8_t)(FT_MODEL_NUMBER >> 8);
+    s_table[5] = (uint8_t)FT_ID;
+    s_table[6] = FT_BAUD_CODE;
+    s_table[7] = 0u; /* return delay */
+    s_table[8] = 1u; /* response status level: answer every instruction */
 
     s_state = S_FF1;
 
     us_timer_init();
-    dxl_gpio_prepare();
+    ft_gpio_prepare();
 
     RCC->APBENR2 |= RCC_APBENR2_USART1EN;
 
     USART1->CR1 = 0u;
-    USART1->BRR = (uint16_t)((SystemCoreClock + (DXL_BAUD / 2u)) / DXL_BAUD);
+    USART1->BRR = (uint16_t)((SystemCoreClock + (FT_BAUD / 2u)) / FT_BAUD);
     USART1->CR2 = 0u;
-    /* OVRDIS keeps a byte lost during a transmission from latching an overrun
-     * the parser would then have to clear before it could resynchronise. */
 #if DXL_BUFFERED
     /* DEM: the USART drives DE around each transmission. DEP: active low, to
      * match U5's OE#. DEAT/DEDT: assert 4/16 of a bit before the start bit and
@@ -767,12 +737,14 @@ void dxl_slave_init(void)
     USART1->CR1 = (4u << USART_CR1_DEAT_Pos) | (4u << USART_CR1_DEDT_Pos);
 #else
     /* HDSEL wires the receiver to the TX pin - the only way to receive on a
-     * board where USART1_RX has nowhere to go. */
+     * board where USART1_RX has nowhere to go. OVRDIS keeps a byte lost during
+     * a transmission from latching an overrun the parser would then have to
+     * clear before it could resynchronise. */
     USART1->CR3 = USART_CR3_HDSEL | USART_CR3_OVRDIS;
 #endif
     /* FIFO mode: eight bytes of receive buffering, so the ISR may be away for
      * up to 80 us at 1 Mbps before a byte is lost, against 10 us with the bare
-     * RDR. That covers a CRC, a reply being framed, and the SPI poll's
+     * RDR. That covers a checksum, a reply being framed, and the SPI poll's
      * critical section together. Must be set before UE. */
     USART1->CR1 |= USART_CR1_FIFOEN;
     USART1->CR1 |= USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE_RXFNEIE;
@@ -780,25 +752,35 @@ void dxl_slave_init(void)
 
     /* Only now, with TX idling high and DE idling inactive, do the pins join
      * the peripheral. */
-    dxl_gpio_connect();
+    ft_gpio_connect();
 
     NVIC_SetPriority(USART1_IRQn, 0u);
     NVIC_EnableIRQ(USART1_IRQn);
 }
 
-void dxl_slave_publish(const uint8_t *block)
+void ft_slave_publish(const uint8_t *block)
 {
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
-    for (uint16_t i = 0u; i < DXL_SENSOR_LEN; i++) {
-        s_table[DXL_SENSOR_ADDR + i] = block[i];
+    for (uint16_t i = 0u; i < FT_SENSOR_LEN; i++) {
+        s_table[FT_SENSOR_ADDR + i] = block[i];
     }
     __set_PRIMASK(primask);
 }
 
-void dxl_slave_set_static(uint16_t addr, const uint8_t *data, uint16_t len)
+void ft_slave_set_fault(bool fault)
 {
-    if (addr >= DXL_SENSOR_ADDR || (uint32_t)addr + len > DXL_SENSOR_ADDR) {
+#if FT_ERR_MIRRORS_FAULTS
+    s_err = fault ? FT_ERR_SENSOR : ERR_NONE;
+#else
+    (void)fault;
+    s_err = ERR_NONE;
+#endif
+}
+
+void ft_slave_set_static(uint16_t addr, const uint8_t *data, uint16_t len)
+{
+    if (addr >= FT_SENSOR_ADDR || (uint32_t)addr + len > FT_SENSOR_ADDR) {
         return; /* the sensor block is publish()'s, not this */
     }
     uint32_t primask = __get_PRIMASK();
@@ -809,7 +791,7 @@ void dxl_slave_set_static(uint16_t addr, const uint8_t *data, uint16_t len)
     __set_PRIMASK(primask);
 }
 
-uint32_t dxl_slave_replies(void)
+uint32_t ft_slave_replies(void)
 {
     return s_replies;
 }

@@ -4,7 +4,7 @@
  *
  * This is a bare CMSIS project - no HAL. The firmware configures SPI1, USART1,
  * TIM3 and every GPIO at the register level anyway (see lsm6dsv16x.c and
- * dxl_slave.c), so the HAL was only ever supplying three things: HAL_Init(),
+ * ft_slave.c), so the HAL was only ever supplying three things: HAL_Init(),
  * SystemClock_Config() and HAL_GetTick(). Those are the forty lines below, and
  * dropping the rest takes the image from roughly 9 KB to 3 KB on a part with
  * 32 KB of flash.
@@ -58,7 +58,7 @@ static void clock_init(void)
     while ((RCC->CFGR & RCC_CFGR_SWS) != 0u) {
     }
 
-    /* dxl_slave.c derives the USART divisor and the TIM3 prescaler from this,
+    /* ft_slave.c derives the USART divisor and the TIM3 prescaler from this,
      * so it has to be true and not merely plausible. */
     SystemCoreClock = 48000000u;
 }
