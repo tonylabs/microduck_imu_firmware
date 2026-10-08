@@ -18,7 +18,7 @@
  * alternate-function **open-drain** while receiving, so an idle-high
  * transmitter releases it, and flips to push-pull for the few hundred
  * microseconds it takes to send. Open-drain the whole time would be simpler,
- * but at 1 Mbps the rise time through the bus pull-up alone is far too slow.
+ * but even at 500 kbps the rise time through the bus pull-up alone is too slow.
  *
  * **Rev 2, DXL_BUFFERED = 1.** A 74LVC1G125 sits between PB6 and the bus, and
  * the bus comes back to PB7 as a normal USART1_RX. Its OE# is driven by
@@ -103,6 +103,11 @@
 
 #define ERR_NONE 0x00u
 
+/** Microseconds one byte occupies on the wire: ten bit times, 8N1. Derived
+ *  from FT_BAUD so that nothing timed in byte times goes stale when the rate
+ *  changes - every such figure below is written in terms of this. */
+#define FT_BYTE_US (10000000u / FT_BAUD)
+
 /** Largest FT-SCS packet: FF FF ID LEN + 255 counted bytes. Sized for the
  *  protocol rather than for the 24-byte SYNC_READ this board actually expects,
  *  so no legal request can be truncated into a shorter one that happens to
@@ -131,8 +136,8 @@ static uint16_t s_last_rx_us; /* TIM3 stamp of the previous byte           */
 
 /** Inter-byte gap, in microseconds, that abandons a part-received packet.
  *
- *  Bytes inside a packet arrive back to back - 10 us apart at 1 Mbps - so any
- *  real gap means the rest of that packet is never coming. Without this a
+ *  Bytes inside a packet arrive back to back - FT_BYTE_US apart, 20 us at
+ *  500 kbps - so any real gap means the rest of that packet is never coming. Without this a
  *  truncated packet keeps counting down its LEN into the *next* packet's bytes
  *  and costs a second transaction as well as the one that was lost, which on
  *  this bus is a whole missed control tick.
@@ -145,7 +150,8 @@ static uint16_t s_last_rx_us; /* TIM3 stamp of the previous byte           */
  *  be faked that way. */
 #define RX_IDLE_RESET_US 2000u
 
-/* 2 ms, not the 100 us it once was. The host's UART loads its transmit FIFO in
+/* 2 ms, and deliberately not scaled with the bit rate: it is sized against the
+ * host, not against the wire. 2 ms, not the 100 us it once was. The host's UART loads its transmit FIFO in
  * chunks and the line idles until an interrupt refills it, and on the Radxa
  * that interrupt is routinely 100-300 us late: measured with the v4 counters,
  * the 100 us rule abandoned 9 of 300 fifteen-byte requests and 26 of 300
@@ -290,7 +296,7 @@ static inline void line_release(void)
 
 static inline void line_drive(void)
 {
-    DXL_PORT->OTYPER &= ~DXL_TX_PIN; /* push-pull: real edges at 1 Mbps */
+    DXL_PORT->OTYPER &= ~DXL_TX_PIN; /* push-pull: real edges on a long bus */
 }
 
 #endif
@@ -360,11 +366,10 @@ static void respond(const uint8_t *params, uint8_t nparams)
 /* -- request dispatch ----------------------------------------------------- */
 
 /** Status packet airtime for @p len payload bytes, in microseconds, plus a
- *  little slack. FF FF + id + len + err + chk = 6 overhead bytes, ten bit
- *  times each at 1 Mbps. */
+ *  little slack. FF FF + id + len + err + chk = 6 overhead bytes. */
 static uint16_t slot_us(uint16_t len)
 {
-    return (uint16_t)(((6u + len) * 10u) + 20u);
+    return (uint16_t)(((6u + len) * FT_BYTE_US) + (2u * FT_BYTE_US));
 }
 
 /**
@@ -728,8 +733,8 @@ void ft_slave_init(void)
 #if DXL_BUFFERED
     /* DEM: the USART drives DE around each transmission. DEP: active low, to
      * match U5's OE#. DEAT/DEDT: assert 4/16 of a bit before the start bit and
-     * hold 4/16 after the stop bit - 250 ns each at 1 Mbps, which is fifty
-     * times U5's enable time and invisible next to the 10 us byte. */
+     * hold 4/16 after the stop bit - 500 ns each at 500 kbps, which is a
+     * hundred times U5's enable time and invisible next to the 20 us byte. */
     /* ORE is reported (no OVRDIS): with a FIFO an overrun means the ISR was
      * away for eight byte times, which is worth counting, and the TC handler
      * flushes the receiver and clears the flag before RE comes back on. */
@@ -743,8 +748,8 @@ void ft_slave_init(void)
     USART1->CR3 = USART_CR3_HDSEL | USART_CR3_OVRDIS;
 #endif
     /* FIFO mode: eight bytes of receive buffering, so the ISR may be away for
-     * up to 80 us at 1 Mbps before a byte is lost, against 10 us with the bare
-     * RDR. That covers a checksum, a reply being framed, and the SPI poll's
+     * up to eight byte times - 160 us at 500 kbps - before a byte is lost,
+     * against one byte time with the bare RDR. That covers a checksum, a reply being framed, and the SPI poll's
      * critical section together. Must be set before UE. */
     USART1->CR1 |= USART_CR1_FIFOEN;
     USART1->CR1 |= USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE_RXFNEIE;
@@ -776,19 +781,6 @@ void ft_slave_set_fault(bool fault)
     (void)fault;
     s_err = ERR_NONE;
 #endif
-}
-
-void ft_slave_set_static(uint16_t addr, const uint8_t *data, uint16_t len)
-{
-    if (addr >= FT_SENSOR_ADDR || (uint32_t)addr + len > FT_SENSOR_ADDR) {
-        return; /* the sensor block is publish()'s, not this */
-    }
-    uint32_t primask = __get_PRIMASK();
-    __disable_irq();
-    for (uint16_t i = 0u; i < len; i++) {
-        s_table[addr + i] = data[i];
-    }
-    __set_PRIMASK(primask);
 }
 
 uint32_t ft_slave_replies(void)

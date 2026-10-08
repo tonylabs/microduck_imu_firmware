@@ -3,8 +3,8 @@
  * @brief   Feetech FT-SCS slave on the servo bus.
  *
  * The Radxa ZERO 3W never talks to the LSM6DSV16X. It opens the servo bus
- * (/dev/ttyS2, 1 Mbps) and issues one SYNC_READ per control tick covering this
- * board and all fifteen HD1910 servos, at address 56 - the same address an
+ * (/dev/ttyS2, 500 kbps) and issues one SYNC_READ per control tick covering
+ * this board and all fifteen HD1910 servos, at address 56 - the same address an
  * HD1910 serves present_position / present_speed / present_load / voltage /
  * temperature from, which is why the whole thing fits in one transaction.
  *
@@ -42,11 +42,10 @@
  * | 2    | 1     | END = 0, i.e. little-endian, as every FT-SCS device     |
  * | 3    | 2     | model, u16 LE - what `scan --protocol feetech` reads    |
  * | 5    | 1     | ID (200)                                                |
- * | 6    | 1     | baud rate code (0 = 1 Mbps, the FT-SCS numbering)       |
+ * | 6    | 1     | baud rate code (1 = 500 kbps, the FT-SCS numbering)     |
  * | 7    | 1     | return delay (0)                                        |
  * | 8    | 1     | response status level (1 = answer every instruction)    |
  * | 16   | 22    | diagnostic counters, 11 x u16 LE - see ft_slave.c       |
- * | 40   | 8     | mounting correction quaternion, 4 x i16 LE, w x y z     |
  * | 56   | 20    | the sensor block above                                  |
  *
  * Gaps read as zero, as does anything past the end of the table: a read is
@@ -64,14 +63,26 @@
 /** This board's ID on the servo bus. FT-SCS allows 0..253. */
 #define FT_ID 200u
 
-/** Bus rate. The HD1910 default, and what the host opens the port at. */
-#define FT_BAUD 1000000u
+/**
+ * Bus rate. Must match what the host opens the port at and what every servo on
+ * the wire is set to.
+ *
+ * 500 kbps, not the HD1910's 1 Mbps factory default - the servos have to be
+ * told the same thing (address 6, the EEPROM baud rate register, code 1). At
+ * 48 MHz this lands BRR on exactly 96, so the divisor carries no rounding
+ * error at all and the whole rate budget is HSI48 trim, as it was at 1 Mbps.
+ *
+ * Everything timed in byte times below is derived from this, so changing it
+ * here is enough.
+ */
+#define FT_BAUD 500000u
 
 #define FT_BROADCAST_ID 0xFEu
 
-/** FT-SCS baud rate code for FT_BAUD. Feetech numbers these the other way up
- *  from Dynamixel: 0 is 1 Mbps, 4 is 115200. */
-#define FT_BAUD_CODE 0u
+/** FT-SCS baud rate code for FT_BAUD, served at address 6. Feetech numbers
+ *  these the other way up from Dynamixel: 0 is 1 Mbps, 1 is 500 kbps, 4 is
+ *  115200. */
+#define FT_BAUD_CODE 1u
 
 /**
  * Model, served at address 3 as u16 LE - where a Feetech device keeps its
@@ -84,8 +95,11 @@
  */
 #define FT_MODEL_NUMBER 0xC011u
 
-/** Bumped when the layout of the block at 56 changes. */
-#define FT_FIRMWARE_VERSION 10u
+/** Bumped when the layout of the block at 56, or the meaning of its status
+ *  byte, changes. 11 dropped the mounting correction of v7: samples are now
+ *  published exactly as the sensor measured them, and FT_STATUS_MOUNT_CORR
+ *  (0x10) is gone rather than merely always clear. */
+#define FT_FIRMWARE_VERSION 11u
 #define FT_FIRMWARE_MINOR   0u
 
 /** Start and length of the sensor block. */
@@ -100,10 +114,11 @@
 #define FT_STATUS_SFLP_READY   0x02u /* at least one quaternion has arrived */
 #define FT_STATUS_FIFO_OVERRUN 0x04u /* FIFO overran since the last publish */
 #define FT_STATUS_SPI_ERROR    0x08u /* an SPI transfer timed out           */
-#define FT_STATUS_MOUNT_CORR   0x10u /* a mounting correction is applied    */
-
-/** Where the mounting correction quaternion is served: four i16, w x y z, x10000. */
-#define FT_MOUNT_ADDR 40u
+/* 0x10 was MOUNT_CORR up to v10, when every sample was rotated by a fixed
+ * per-robot mounting trim before publication. The board is mounted straight
+ * and nothing is applied now, so the flag is retired rather than hard-wired
+ * clear - do not reuse the bit for something else, or a host that still knows
+ * the old meaning will read it as a correction being applied. */
 
 /**
  * Report a dead IMU in the FT-SCS error byte as well as in the status flags.
@@ -152,9 +167,6 @@ void ft_slave_publish(const uint8_t *block);
  * be claiming to be healthy.
  */
 void ft_slave_set_fault(bool fault);
-
-/** Write @p len bytes of static table content at @p addr (diagnostics, identity). */
-void ft_slave_set_static(uint16_t addr, const uint8_t *data, uint16_t len);
 
 /** Status packets sent since boot. Handy on a scope-less bench. */
 uint32_t ft_slave_replies(void);

@@ -14,7 +14,6 @@
  */
 
 #include "app.h"
-#include "mount.h"
 
 #include <string.h>
 
@@ -205,15 +204,6 @@ void app_init(void)
      * silent looks the same as an unplugged connector. */
     ft_slave_init();
 
-    /* The mounting correction in force, so a host can read what this board is
-     * doing to its samples rather than infer it. */
-    {
-        int16_t c[4]; uint8_t raw[8];
-        mount_correction_i16(c);
-        for (int i = 0; i < 4; i++) { put_i16(&raw[i * 2], c[i]); }
-        ft_slave_set_static(FT_MOUNT_ADDR, raw, 8u);
-    }
-
     s_next_poll = board_millis();
     s_next_blink = s_next_poll;
     /* Unsigned wraparound puts this exactly FAULT_HOLD_MS in the past however
@@ -277,37 +267,27 @@ void app_task(void)
 
     (void)lsm6dsv16x_poll(&s_sample);
 
-    /* Per-robot mounting trim, before anything is published - mount.h.
-     *
-     * On copies, never on s_sample itself. The gyro and accelerometer are
-     * re-read from the chip every poll, but the quaternion only changes when
-     * the FIFO delivers one (120 Hz against a 500 Hz poll), so correcting it in
-     * place applied the rotation again on every poll until the next sample -
-     * a static robot published four or five different orientations in turn. */
-    int16_t  gyro[3] = { s_sample.gyro[0], s_sample.gyro[1], s_sample.gyro[2] };
-    int16_t  acc[3]  = { s_sample.acc[0], s_sample.acc[1], s_sample.acc[2] };
-    uint16_t quat[3] = { s_sample.quat[0], s_sample.quat[1], s_sample.quat[2] };
-    mount_correct_vec(gyro);
-    mount_correct_vec(acc);
-    if (s_sample.quat_valid) {
-        mount_correct_quat(quat);
-    }
-
+    /* Straight from the chip, in the sensor frame, with nothing applied on the
+     * way out. v7 to v10 rotated every sample here by a fixed per-robot trim,
+     * because the board was mounted 12.4 degrees nose-down and the host had no
+     * knob for it; the board is mounted straight now, so the honest thing to
+     * publish is what the sensor measured. git history has the correction if a
+     * crooked board ever turns up again. */
     uint8_t block[FT_SENSOR_LEN];
-    put_i16(&block[0], gyro[0]);
-    put_i16(&block[2], gyro[1]);
-    put_i16(&block[4], gyro[2]);
+    put_i16(&block[0], s_sample.gyro[0]);
+    put_i16(&block[2], s_sample.gyro[1]);
+    put_i16(&block[4], s_sample.gyro[2]);
     /* Left at zero until SFLP has written its table. The host reads all-zero
      * here as "orientation unknown" and holds its last good quaternion, which
      * is the only honest answer during the ~0.7 s the algorithm takes to
      * settle - reporting identity would tell fall detection the robot is
      * upright. */
-    put_u16(&block[6], s_sample.quat_valid ? quat[0] : 0u);
-    put_u16(&block[8], s_sample.quat_valid ? quat[1] : 0u);
-    put_u16(&block[10], s_sample.quat_valid ? quat[2] : 0u);
-    put_i16(&block[12], acc[0]);
-    put_i16(&block[14], acc[1]);
-    put_i16(&block[16], acc[2]);
+    put_u16(&block[6], s_sample.quat_valid ? s_sample.quat[0] : 0u);
+    put_u16(&block[8], s_sample.quat_valid ? s_sample.quat[1] : 0u);
+    put_u16(&block[10], s_sample.quat_valid ? s_sample.quat[2] : 0u);
+    put_i16(&block[12], s_sample.acc[0]);
+    put_i16(&block[14], s_sample.acc[1]);
+    put_i16(&block[16], s_sample.acc[2]);
 
     /* The counter is what tells the host a block is genuinely new. duck-control
      * already watches for a repeated 12-byte block and calls the orientation
@@ -318,9 +298,6 @@ void app_task(void)
     if (s_sample.quat_valid) {
         status |= FT_STATUS_SFLP_READY;
     }
-#if MOUNT_CORR_ENABLED
-    status |= FT_STATUS_MOUNT_CORR;
-#endif
     if (s_sample.fifo_overrun) {
         status |= FT_STATUS_FIFO_OVERRUN;
         s_sample.fifo_overrun = false; /* sticky until reported, then cleared */

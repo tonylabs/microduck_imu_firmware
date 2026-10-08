@@ -1,16 +1,31 @@
-# microduck IMU firmware (`imu_to_ft` v10)
+# microduck IMU firmware (`imu_to_ft` v11)
 
 Firmware for the STM32C011F6U6TR on the microduck IMU board: it reads an
 LSM6DSV16XTR over SPI and serves the result on the servo bus as a **Feetech
 FT-SCS** device at ID 200.
 
+> **v11 publishes raw samples.** v7 to v10 rotated every gyro, accelerometer
+> and quaternion sample by a fixed per-robot mounting trim before putting it on
+> the bus, because the board was measured 12.4 degrees nose-down on duck-a4ca
+> and the host had no knob for it. The board is mounted straight now, so the
+> correction is gone: what this firmware publishes is what the sensor measured.
+> `Src/mount.c` and `Inc/mount.h` are deleted, the status flag `0x10`
+> (`MOUNT_CORR`) is retired, and address 40 no longer serves a correction
+> quaternion. The firmware is 5 640 bytes smaller for it - the quaternion maths
+> was the only thing in the image pulling in software floating point. If a
+> crooked board ever turns up again, the whole module is in git at `v7`.
+>
 > **v10 changed the protocol.** Up to v9 this board was a Dynamixel Protocol
 > 2.0 device serving its block at address 124, because the servos were XL330s.
 > They are now **FEETECH HD1910**, which speak FT-SCS, so the board does too.
 > What moved: the wire format, the address of the sensor block (124 -> **56**),
-> the baud rate *code* (3 -> **0**; the rate itself is still 1 Mbps), and where
-> the identity registers live. What did not move: the ID (200), the bus speed,
-> the 20-byte block layout, the pinout, and every line of the sensor path.
+> the identity registers live. What did not move: the ID (200), the 20-byte
+> block layout, the pinout, and every line of the sensor path.
+>
+> **The bus now runs at 500 kbps**, not the 1 Mbps it did under Dynamixel and
+> not the HD1910's factory default. The servos have to agree: their EEPROM
+> baud rate register (address 6) must be set to code **1**, and the host must
+> open the port at 500000.
 
 ---
 
@@ -20,9 +35,9 @@ FT-SCS** device at ID 200.
 SBC and the sensor. The path is:
 
 ```
-Radxa ZERO 3W  --/dev/ttyS2, FT-SCS, 1 Mbps--+-- ID 200  this board --SPI--> LSM6DSV16XTR
-   robotd                                    +-- ID  ..  HD1910 servo
-                                             +-- ... 15 servos total
+Radxa ZERO 3W  --/dev/ttyS2, FT-SCS, 500 kbps--+-- ID 200  this board --SPI--> LSM6DSV16XTR
+   robotd                                      +-- ID  ..  HD1910 servo
+                                               +-- ... 15 servos total
 ```
 
 Per control tick (50 Hz) the host issues **one** `SYNC_READ` covering this board
@@ -75,8 +90,16 @@ below makes that fault unambiguous.
 | 19 | 1 | status flags |
 
 Status flags: `0x01` IMU present (WHO_AM_I matched), `0x02` SFLP ready,
-`0x04` FIFO overran since last publish, `0x08` SPI transfer timed out,
-`0x10` a mounting correction is applied (v7, below).
+`0x04` FIFO overran since last publish, `0x08` SPI transfer timed out.
+
+`0x10` was `MOUNT_CORR` up to v10 and is **retired, not reused**: a host that
+still knows the old meaning would read a recycled bit as a correction being
+applied.
+
+Samples go on the bus exactly as the LSM6DSV16X measured them, in the sensor
+frame. Nothing is rotated, scaled or filtered on this board - rotating into the
+trunk frame is the host's job, and it is the only place that knows how the
+board is mounted.
 
 ### The rest of the register file
 
@@ -88,16 +111,15 @@ control table** and nothing tries to make it look like one.
 
 | addr | size | value |
 |---|---|---|
-| 0 | 1 | firmware major version (10) |
+| 0 | 1 | firmware major version (11) |
 | 1 | 1 | firmware minor version |
 | 2 | 1 | `END` = 0, i.e. little-endian, as every FT-SCS device |
 | 3 | 2 | model, `u16` LE = `0xC011` - where `servocom`'s scanner looks |
 | 5 | 1 | ID (200) |
-| 6 | 1 | baud rate code - **0 = 1 Mbps** in Feetech's numbering |
+| 6 | 1 | baud rate code - **1 = 500 kbps** in Feetech's numbering (0 is 1 Mbps, 4 is 115200) |
 | 7 | 1 | return delay (0) |
 | 8 | 1 | response status level (1 = answer every instruction) |
 | 16 | 22 | diagnostic counters (v4), eleven `u16` LE, wrapping, never cleared - take differences: requests that reached the parser, checksum failures, mid-packet gap resets, receiver FE/NE, `SYNC_READ`s answered, replies framed, replies completed (TC), largest mid-packet gap tolerated (us, v5), the gap that caused the last reset and the byte it struck at, receiver overruns (v6). `read 200 16 22` after a run says where a request the host never got an answer to actually died |
-| 40 | 8 | mounting correction in force (v7): the sensor-frame quaternion w, x, y, z as four `i16` x 10000. `(10000, 0, 0, 0)` means none |
 | 56 | 20 | the sensor block above |
 
 Gaps read as zero, as does anything past the end of the table - see *Reads
@@ -246,7 +268,7 @@ PA12 DXL_DIR  ──► OE#     └── PB7 USART1_RX
 DXL_DIR is not toggled by software. PA12 is `USART1_DE`, the USART's own
 driver-enable output: with `CR3.DEM` set it asserts DE ahead of every start bit
 and releases it after the last stop bit, timed in sixteenths of a bit by
-`DEAT`/`DEDT` (4/16, i.e. 250 ns at 1 Mbps). `CR3.DEP` inverts it to match the
+`DEAT`/`DEDT` (4/16, i.e. 500 ns at 500 kbps). `CR3.DEP` inverts it to match the
 active-low OE#. The firmware therefore cannot release the bus late, or early.
 
 Because PB7 sits on the bus, everything this board transmits comes straight
@@ -280,7 +302,7 @@ direction pin**. PB6 is `USART1_TX`; `USART1_RX` cannot be routed to it. So:
   servo. So PB6 sits in alternate-function **open-drain** while receiving (an
   idle-high transmitter simply releases it) and flips to **push-pull** for the
   ~230 µs it takes to send a status packet. Open-drain throughout would be
-  simpler, but at 1 Mbps the pull-up alone cannot make the rising edges.
+  simpler, but the pull-up alone cannot make the rising edges at this rate.
 
 On both revisions the IMU's SDx and SCx are tied to GND, and INT2 / OCS_AUX /
 SDO_AUX are open — plain 4-wire SPI with no OIS chain.
@@ -295,9 +317,10 @@ oscillator, which is running out of reset.
 `clock_init()` in `main.c` touches three things: one flash wait state, `HSIDIV`
 to 000, and `SW` to HSISYS. That is the whole clock tree. The divider is the
 part that matters — HSIDIV comes up at 0b010, so the reset SYSCLK is 12 MHz, and
-at 12 MHz a 1 Mbps USART is unreachable with 16x oversampling (`USARTDIV` must
-be at least 16). At 48 MHz `BRR` lands on exactly 48, with no rounding error at
-all.
+at 12 MHz a megabaud USART is unreachable with 16x oversampling (`USARTDIV`
+must be at least 16), and the board was a 1 Mbps device when this was written.
+At 48 MHz `BRR` lands on exactly 96 for the 500 kbps the bus now runs at - and
+on exactly 48 at 1 Mbps - so the divisor carries no rounding error either way.
 
 So the entire bus-rate error budget is HSI48 trim. From DS13866 Rev 5, Table 40:
 
@@ -307,7 +330,7 @@ So the entire bus-rate error budget is HSI48 trim. From DS13866 Rev 5, Table 40:
 | drift, T_A = 0 to 85 °C | ±1 % |
 | drift, T_A = −40 to 125 °C | −2.5 % / +2 % |
 
-A 1 Mbps 8N1 link tolerates roughly ±2 % end to end, and everything else on the
+An 8N1 link tolerates roughly ±2 % end to end, and everything else on the
 bus — the HD1910s, a USB-TTL adapter — is crystal-clocked, so nearly all of that budget is
 ours to spend. ±1 % across 0–85 °C leaves real margin; the −40 °C corner is
 where it would get tight, which is not where this robot lives. If a particular
@@ -358,7 +381,6 @@ whose peripherals are all configured by hand it costs little.
 | `Src/lsm6dsv16x.c` | SPI1 at register level; chip config; FIFO drain for SFLP |
 | `Src/ft_slave.c` | FT-SCS slave on USART1, all in the ISR; hardware DE (Rev 2) or HDSEL + open-drain (Rev 1) |
 | `Src/app.c` | poll loop, sensor block assembly, LED |
-| `Src/mount.c`, `Inc/mount.h` | per-robot mounting correction (v7): a fixed sensor-frame rotation applied to gyro, accel and the SFLP quaternion before publishing, so a board mounted a few degrees off reads as mounted straight. The host has no trim for this; the constants and the measurement procedure are in `mount.h` |
 
 From the CubeIDE template and not worth reading: `Src/syscalls.c`,
 `Src/sysmem.c`, `Src/system_stm32c0xx.c`, `Startup/`, `STM32C011F6UX_FLASH.ld`.
@@ -400,7 +422,7 @@ cannot build up. An SFLP ODR of 15 or 30 Hz would trip one constantly.
   as soon as its last CRC byte lands. `return_delay_time` is 0, matching what
   the host asserts of the servos.
 * The USART runs in **FIFO mode** (v3): eight bytes of receive buffering, so
-  the ISR may be away for 80 µs at 1 Mbps before a byte is lost, against 10 µs
+  the ISR may be away for eight byte times - 160 µs at 500 kbps - before a byte is lost, against one byte time
   with the bare `RDR`. Both CRCs — the check on a request and the signature on
   the reply — are table-driven, about 2 µs each. v2 computed them bitwise
   (~25 µs each) with no FIFO, and also buffered and CRC-checked the host's
@@ -469,24 +491,32 @@ Also verified off-target:
 
   | config | flash | RAM |
   |---|---|---|
-  | Rev 2, Release (`-Os`) | 9 456 / 32 768 - 29 % | 3 796 / 6 144 - 62 % |
-  | Rev 1, Release (`-Os`) | 9 364 / 32 768 - 29 % | same |
-  | Rev 2, Debug (`-O0 -g3`) | 14 020 / 32 768 - 43 % | same |
+  | Rev 2, Release (`-Os`) | 3 820 / 32 768 - **12 %** | 3 788 / 6 144 - 62 % |
+  | Rev 1, Release (`-Os`) | 3 728 / 32 768 - 11 % | same |
+  | Rev 2, Debug (`-O0 -g3`) | 7 344 / 32 768 - 22 % | same |
 
-  RAM is 2 260 bytes of `.bss` plus the linker script's 0x200 heap and 0x400
+  RAM is 2 252 bytes of `.bss` plus the linker script's 0x200 heap and 0x400
   stack. `.bss` grew about 300 bytes over v9: the receive and transmit buffers
   are now sized for the FT-SCS maximum rather than for the longest packet this
-  board expects.
+  board expects. Flash fell by 5 640 bytes in v11 - `mount.c` did quaternion
+  arithmetic in `float`, and on a Cortex-M0+ with no FPU that pulled the whole
+  software floating-point library into the image. Nothing else here uses it.
 
 Verified **on hardware** (Rev 2 board, STLINK-V3MINIE over SWD, target at
 3.21 V, device ID 0x443), 2026-10-04:
 
 * Flashed and read back verified; the firmware runs, SysTick counts past 21 s.
-* The FT-SCS header reads back exactly as intended: `fw 10.0`, `END 0`,
+* The FT-SCS header reads back exactly as intended: `fw 11.0`, `END 0`,
   `model 0xC011`, `id 200`, `baud_code 0`, `delay 0`, `response level 1`.
 * `s_imu_present = 1` - the LSM6DSV16X answered `WHO_AM_I` over SPI1.
-* Status byte `0x13` = `IMU_PRESENT | SFLP_READY | MOUNT_CORR`, with
-  `FIFO_OVERRUN` and `SPI_ERROR` clear. Error byte `0x00`.
+* Status byte `0x03` = `IMU_PRESENT | SFLP_READY`, with `FIFO_OVERRUN` and
+  `SPI_ERROR` clear. Error byte `0x00`.
+* **The published block is byte-for-byte the raw sample** - the 18 data bytes
+  at 56 compared against `s_gyro`/`s_quat`/`s_acc` read straight out of
+  `s_sample`, equal on every one of three reads. That is the v11 change, and it
+  is the only way to tell from outside that no rotation is being applied.
+* Addresses 40-47, which served the mounting correction up to v10, read back
+  all zero.
 * Accelerometer magnitude **0.9988 / 1.0046 / 1.0051 g** across three reads.
   This is the load-bearing number: it confirms the +/-4 g full scale and the
   0.122 mg/LSB conversion together, because only the right pair gives 1 g.
@@ -497,18 +527,16 @@ Verified **on hardware** (Rev 2 board, STLINK-V3MINIE over SWD, target at
   false-trip.
 * Diagnostic counters all zero, including `chk_fail`, `gap_reset` and
   `line_err` - nothing on the wire, as expected with no master attached.
-* The mounting correction reads back at address 40 as
-  `(9941, 0, 1066, -191)`.
 
 Earlier revisions of this board also measured, on **Rev 1** hardware and still
-true of the sensor path, which v10 did not touch: publish rate 500.45 Hz
+true of the sensor path, which neither v10 nor v11 touched: publish rate 500.45 Hz
 against the 500 Hz schedule (+0.09 %); gyro bias steady at -0.44 / 0.00 /
 +0.19 dps; uptime past three minutes with no hang or drift; the LED PWM running
 in hardware with SWD intact.
 
 Still unverified: **the bus itself.** `ft_slave_replies()` reads 0 because
 nothing is polling - that needs the robot, or a USB-TTL adapter on the bus
-connector driving FT-SCS at 1 Mbps. Everything on this board up to the
+connector driving FT-SCS at 500 kbps. Everything on this board up to the
 connector is now proven, and the framing it would put on the wire is proven
 byte for byte; what has not been watched is a real master getting an answer,
 and PA12 going low around each status packet and nowhere else.
