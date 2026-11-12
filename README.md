@@ -22,10 +22,10 @@ FT-SCS** device at ID 200.
 > the identity registers live. What did not move: the ID (200), the 20-byte
 > block layout, the pinout, and every line of the sensor path.
 >
-> **The bus now runs at 500 kbps**, not the 1 Mbps it did under Dynamixel and
-> not the HD1910's factory default. The servos have to agree: their EEPROM
-> baud rate register (address 6) must be set to code **1**, and the host must
-> open the port at 500000.
+> **The bus runs at 1 Mbps**, matching the HD1910's factory default.
+> The servos have to agree: their EEPROM
+> baud rate register (address 6) must be set to code **0**, and the host must
+> open the port at 1000000.
 
 ---
 
@@ -35,7 +35,7 @@ FT-SCS** device at ID 200.
 SBC and the sensor. The path is:
 
 ```
-Radxa ZERO 3W  --/dev/ttyS2, FT-SCS, 500 kbps--+-- ID 200  this board --SPI--> LSM6DSV16XTR
+Radxa ZERO 3W  --/dev/ttyS2, FT-SCS, 1 Mbps  --+-- ID 200  this board --SPI--> LSM6DSV16XTR
    robotd                                      +-- ID  ..  HD1910 servo
                                                +-- ... 15 servos total
 ```
@@ -116,7 +116,7 @@ control table** and nothing tries to make it look like one.
 | 2 | 1 | `END` = 0, i.e. little-endian, as every FT-SCS device |
 | 3 | 2 | model, `u16` LE = `0xC011` - where `servocom`'s scanner looks |
 | 5 | 1 | ID (200) |
-| 6 | 1 | baud rate code - **1 = 500 kbps** in Feetech's numbering (0 is 1 Mbps, 4 is 115200) |
+| 6 | 1 | baud rate code - **0 = 1 Mbps** in Feetech's numbering (1 is 500 kbps, 4 is 115200) |
 | 7 | 1 | return delay (0) |
 | 8 | 1 | response status level (1 = answer every instruction) |
 | 16 | 22 | diagnostic counters (v4), eleven `u16` LE, wrapping, never cleared - take differences: requests that reached the parser, checksum failures, mid-packet gap resets, receiver FE/NE, `SYNC_READ`s answered, replies framed, replies completed (TC), largest mid-packet gap tolerated (us, v5), the gap that caused the last reset and the byte it struck at, receiver overruns (v6). `read 200 16 22` after a run says where a request the host never got an answer to actually died |
@@ -268,7 +268,7 @@ PA12 DXL_DIR  ──► OE#     └── PB7 USART1_RX
 DXL_DIR is not toggled by software. PA12 is `USART1_DE`, the USART's own
 driver-enable output: with `CR3.DEM` set it asserts DE ahead of every start bit
 and releases it after the last stop bit, timed in sixteenths of a bit by
-`DEAT`/`DEDT` (4/16, i.e. 500 ns at 500 kbps). `CR3.DEP` inverts it to match the
+`DEAT`/`DEDT` (4/16, i.e. 250 ns at 1 Mbps). `CR3.DEP` inverts it to match the
 active-low OE#. The firmware therefore cannot release the bus late, or early.
 
 Because PB7 sits on the bus, everything this board transmits comes straight
@@ -318,9 +318,8 @@ oscillator, which is running out of reset.
 to 000, and `SW` to HSISYS. That is the whole clock tree. The divider is the
 part that matters — HSIDIV comes up at 0b010, so the reset SYSCLK is 12 MHz, and
 at 12 MHz a megabaud USART is unreachable with 16x oversampling (`USARTDIV`
-must be at least 16), and the board was a 1 Mbps device when this was written.
-At 48 MHz `BRR` lands on exactly 96 for the 500 kbps the bus now runs at - and
-on exactly 48 at 1 Mbps - so the divisor carries no rounding error either way.
+must be at least 16). At 48 MHz `BRR` lands on exactly 48 for the 1 Mbps
+bus rate, so the divisor carries no rounding error.
 
 So the entire bus-rate error budget is HSI48 trim. From DS13866 Rev 5, Table 40:
 
@@ -422,7 +421,7 @@ cannot build up. An SFLP ODR of 15 or 30 Hz would trip one constantly.
   as soon as its last CRC byte lands. `return_delay_time` is 0, matching what
   the host asserts of the servos.
 * The USART runs in **FIFO mode** (v3): eight bytes of receive buffering, so
-  the ISR may be away for eight byte times - 160 µs at 500 kbps - before a byte is lost, against one byte time
+  the ISR may be away for eight byte times - 80 µs at 1 Mbps - before a byte is lost, against one byte time
   with the bare `RDR`. Both CRCs — the check on a request and the signature on
   the reply — are table-driven, about 2 µs each. v2 computed them bitwise
   (~25 µs each) with no FIFO, and also buffered and CRC-checked the host's
@@ -536,7 +535,7 @@ in hardware with SWD intact.
 
 Still unverified: **the bus itself.** `ft_slave_replies()` reads 0 because
 nothing is polling - that needs the robot, or a USB-TTL adapter on the bus
-connector driving FT-SCS at 500 kbps. Everything on this board up to the
+connector driving FT-SCS at 1 Mbps. Everything on this board up to the
 connector is now proven, and the framing it would put on the wire is proven
 byte for byte; what has not been watched is a real master getting an answer,
 and PA12 going low around each status packet and nowhere else.

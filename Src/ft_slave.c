@@ -136,8 +136,8 @@ static uint16_t s_last_rx_us; /* TIM3 stamp of the previous byte           */
 
 /** Inter-byte gap, in microseconds, that abandons a part-received packet.
  *
- *  Bytes inside a packet arrive back to back - FT_BYTE_US apart, 20 us at
- *  500 kbps - so any real gap means the rest of that packet is never coming. Without this a
+ *  Bytes inside a packet arrive back to back - FT_BYTE_US apart, 10 us at
+ *  1 Mbps - so any real gap means the rest of that packet is never coming. Without this a
  *  truncated packet keeps counting down its LEN into the *next* packet's bytes
  *  and costs a second transaction as well as the one that was lost, which on
  *  this bus is a whole missed control tick.
@@ -733,8 +733,8 @@ void ft_slave_init(void)
 #if DXL_BUFFERED
     /* DEM: the USART drives DE around each transmission. DEP: active low, to
      * match U5's OE#. DEAT/DEDT: assert 4/16 of a bit before the start bit and
-     * hold 4/16 after the stop bit - 500 ns each at 500 kbps, which is a
-     * hundred times U5's enable time and invisible next to the 20 us byte. */
+     * hold 4/16 after the stop bit - 250 ns each at 1 Mbps, which is a
+     * wide margin over U5's enable time and short next to the 10 us byte. */
     /* ORE is reported (no OVRDIS): with a FIFO an overrun means the ISR was
      * away for eight byte times, which is worth counting, and the TC handler
      * flushes the receiver and clears the flag before RE comes back on. */
@@ -748,7 +748,7 @@ void ft_slave_init(void)
     USART1->CR3 = USART_CR3_HDSEL | USART_CR3_OVRDIS;
 #endif
     /* FIFO mode: eight bytes of receive buffering, so the ISR may be away for
-     * up to eight byte times - 160 us at 500 kbps - before a byte is lost,
+     * up to eight byte times - 80 us at 1 Mbps - before a byte is lost,
      * against one byte time with the bare RDR. That covers a checksum, a reply being framed, and the SPI poll's
      * critical section together. Must be set before UE. */
     USART1->CR1 |= USART_CR1_FIFOEN;

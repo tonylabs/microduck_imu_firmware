@@ -3,7 +3,7 @@
  * @brief   Feetech FT-SCS slave on the servo bus.
  *
  * The Radxa ZERO 3W never talks to the LSM6DSV16X. It opens the servo bus
- * (/dev/ttyS2, 500 kbps) and issues one SYNC_READ per control tick covering
+ * (/dev/ttyS2, 1 Mbps) and issues one SYNC_READ per control tick covering
  * this board and all fifteen HD1910 servos, at address 56 - the same address an
  * HD1910 serves present_position / present_speed / present_load / voltage /
  * temperature from, which is why the whole thing fits in one transaction.
@@ -42,7 +42,7 @@
  * | 2    | 1     | END = 0, i.e. little-endian, as every FT-SCS device     |
  * | 3    | 2     | model, u16 LE - what `scan --protocol feetech` reads    |
  * | 5    | 1     | ID (200)                                                |
- * | 6    | 1     | baud rate code (1 = 500 kbps, the FT-SCS numbering)     |
+ * | 6    | 1     | baud rate code (0 = 1 Mbps, the FT-SCS numbering)     |
  * | 7    | 1     | return delay (0)                                        |
  * | 8    | 1     | response status level (1 = answer every instruction)    |
  * | 16   | 22    | diagnostic counters, 11 x u16 LE - see ft_slave.c       |
@@ -67,22 +67,21 @@
  * Bus rate. Must match what the host opens the port at and what every servo on
  * the wire is set to.
  *
- * 500 kbps, not the HD1910's 1 Mbps factory default - the servos have to be
- * told the same thing (address 6, the EEPROM baud rate register, code 1). At
- * 48 MHz this lands BRR on exactly 96, so the divisor carries no rounding
- * error at all and the whole rate budget is HSI48 trim, as it was at 1 Mbps.
+ * 1 Mbps, matching the HD1910's factory default (address 6, the EEPROM
+ * baud rate register, code 0). At 48 MHz this lands BRR on exactly 48, so
+ * the divisor carries no rounding error and the rate budget is HSI48 trim.
  *
  * Everything timed in byte times below is derived from this, so changing it
  * here is enough.
  */
-#define FT_BAUD 500000u
+#define FT_BAUD 1000000u
 
 #define FT_BROADCAST_ID 0xFEu
 
 /** FT-SCS baud rate code for FT_BAUD, served at address 6. Feetech numbers
  *  these the other way up from Dynamixel: 0 is 1 Mbps, 1 is 500 kbps, 4 is
  *  115200. */
-#define FT_BAUD_CODE 1u
+#define FT_BAUD_CODE 0u
 
 /**
  * Model, served at address 3 as u16 LE - where a Feetech device keeps its
