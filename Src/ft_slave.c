@@ -720,6 +720,9 @@ void ft_slave_init(void)
     s_table[7] = 0u; /* return delay */
     s_table[8] = 1u; /* response status level: answer every instruction */
 
+    /* Until the first quaternion arrives, the FT6 sample is not valid. */
+    s_table[FT_SENSOR_ADDR + FT_STATUS_OFFSET] = FT_STATUS_NOT_READY;
+
     s_state = S_FF1;
 
     us_timer_init();

@@ -1,10 +1,16 @@
-# microduck IMU firmware (`imu_to_ft` v11)
+# microduck IMU firmware (Microduck FT6 compatible)
 
 Firmware for the STM32C011F6U6TR on the microduck IMU board: it reads an
 LSM6DSV16XTR over SPI and serves the result on the servo bus as a **Feetech
 FT-SCS** device at ID 200.
 
-> **v11 publishes raw samples.** v7 to v10 rotated every gyro, accelerometer
+> **The current wire format is Microduck FT6:** identity `06 00 00 00 F2`,
+> sensor block at address 56, length 15, and a 1 Mbps bus. Gyro and quaternion
+> samples remain raw. Counter/status/reserved occupy offsets 12/13/14; healthy
+> status and reserved are both zero. Accelerometer samples are no longer
+> exposed in this block. See [the runtime contract](docs/ft6-runtime.md).
+>
+> **v11 published raw samples.** v7 to v10 rotated every gyro, accelerometer
 > and quaternion sample by a fixed per-robot mounting trim before putting it on
 > the bus, because the board was measured 12.4 degrees nose-down on duck-a4ca
 > and the host had no knob for it. The board is mounted straight now, so the
@@ -41,10 +47,10 @@ Radxa ZERO 3W  --/dev/ttyS2, FT-SCS, 1 Mbps  --+-- ID 200  this board --SPI--> L
 ```
 
 Per control tick (50 Hz) the host issues **one** `SYNC_READ` covering this board
-and all fifteen servos, at **address 56, length 12**. That address is not
+and all fifteen servos, at **address 56, length 15**. That address is not
 arbitrary: on an HD1910 it is the start of `present_position` /
 `present_speed` / `present_load` / `present_voltage` / `present_temperature`,
-and 12 bytes covers the lot - so the IMU can ride the same transaction instead
+and the first 12 bytes cover the servo feedback - so the IMU can ride the same transaction instead
 of being a separate poll. This board is listed **first** in the ID list, so it
 answers before the servo burst.
 
@@ -61,7 +67,7 @@ low-power) block produces a game-rotation quaternion and estimates its own gyro
 bias; the host only rotates it into the trunk frame, derives gravity, and runs
 a 3-sample median for spike rejection.
 
-### The 12 bytes the tick consumes
+### The first 12 bytes: gyro and quaternion
 
 | bytes | contents |
 |---|---|
@@ -76,25 +82,25 @@ unknown-orientation robot is upright). This firmware therefore publishes zeros
 until the first quaternion actually arrives, roughly 0.7 s after power-up.
 
 A block identical to its predecessor means "the read succeeded but the board
-handed back the same sample". The byte-18 sample counter in the full block
+handed back the same sample". The byte-12 publication counter in the full block
 below makes that fault unambiguous.
 
-### The full 20-byte block this firmware serves at 56
+### The FT6 15-byte block this firmware serves at 56
 
 | offset | bytes | contents |
 |---|---|---|
 | 0 | 6 | gyro x/y/z, `i16` LE, +/-500 dps |
 | 6 | 6 | SFLP quaternion x/y/z, binary16 LE |
-| 12 | 6 | accelerometer x/y/z, `i16` LE, +/-4 g (0.122 mg/LSB) |
-| 18 | 1 | sample counter, wraps at 256 |
-| 19 | 1 | status flags |
+| 12 | 1 | publication counter, wraps at 256 |
+| 13 | 1 | fault status, zero when healthy |
+| 14 | 1 | reserved, always zero |
 
-Status flags: `0x01` IMU present (WHO_AM_I matched), `0x02` SFLP ready,
-`0x04` FIFO overran since last publish, `0x08` SPI transfer timed out.
-
-`0x10` was `MOUNT_CORR` up to v10 and is **retired, not reused**: a host that
-still knows the old meaning would read a recycled bit as a correction being
-applied.
+Status bits emitted by this firmware: `0x01` no SFLP quaternion yet,
+`0x02` FIFO overran since last publish, `0x04` SPI transfer timed out.
+The runtime accepts status values up to `0x0F`, but requires bits 0–2 clear
+for a valid sample. Bit 3 is unused here; bits 4–7 must stay zero. This differs
+from the old v11 positive `IMU_PRESENT`/`SFLP_READY` flags. Startup is explicitly
+not ready, even before the first sample is published.
 
 Samples go on the bus exactly as the LSM6DSV16X measured them, in the sensor
 frame. Nothing is rotated, scaled or filtered on this board - rotating into the
@@ -111,27 +117,25 @@ control table** and nothing tries to make it look like one.
 
 | addr | size | value |
 |---|---|---|
-| 0 | 1 | firmware major version (11) |
+| 0 | 1 | reported compatibility major version (6) |
 | 1 | 1 | firmware minor version |
 | 2 | 1 | `END` = 0, i.e. little-endian, as every FT-SCS device |
-| 3 | 2 | model, `u16` LE = `0xC011` - where `servocom`'s scanner looks |
+| 3 | 2 | model, `u16` LE = `0xF200` - where `servocom`'s scanner looks |
 | 5 | 1 | ID (200) |
 | 6 | 1 | baud rate code - **0 = 1 Mbps** in Feetech's numbering (1 is 500 kbps, 4 is 115200) |
 | 7 | 1 | return delay (0) |
 | 8 | 1 | response status level (1 = answer every instruction) |
 | 16 | 22 | diagnostic counters (v4), eleven `u16` LE, wrapping, never cleared - take differences: requests that reached the parser, checksum failures, mid-packet gap resets, receiver FE/NE, `SYNC_READ`s answered, replies framed, replies completed (TC), largest mid-packet gap tolerated (us, v5), the gap that caused the last reset and the byte it struck at, receiver overruns (v6). `read 200 16 22` after a run says where a request the host never got an answer to actually died |
-| 56 | 20 | the sensor block above |
+| 56 | 15 | the FT6 sensor block above |
 
 Gaps read as zero, as does anything past the end of the table - see *Reads
 never fail* below.
 
-`0xC011` is far outside the range any real Feetech servo reports (the highest
-registered in `servocom` is the SM40BL at 10248), so a scan cannot mistake this
-board for a servo. It is also what this board reported as its Dynamixel model
-number, so a board stays identifiable across the protocol change. `servocom`'s
-`ServoKind` has no entry for it, so `scan --protocol feetech` prints *"Found
-motor with id 200 with ... (raw: 49169)"* - correct, just unnamed. Adding it to
-`src/servo/mod.rs` would give it a name.
+The identity registers at addresses 0..4 return **`06 00 00 00 F2`**:
+reported version 6.0, little-endian data, and model `0xF200`. This matches the
+FT6 signature expected by the Microduck host. The payload also matches its FT6 56/15 decoder, including the counter, fault
+status and zero reserved byte.
+The earlier identity was version 11.0 and model `0xC011`.
 
 ---
 
@@ -207,7 +211,7 @@ which is the closest true statement FT-SCS can make about an IMU that is not
 answering either. A dead board therefore shows up as an error in generic
 tooling, with no IMU-specific host code.
 
-The authoritative answer is still byte 19 of the sensor block. Set
+The fault status is byte 13 of the sensor block. Set
 `FT_ERR_MIRRORS_FAULTS` to 0 in `ft_slave.h` for a board that must never look
 faulted to generic tooling.
 
@@ -448,7 +452,7 @@ cannot build up. An SFLP ODR of 15 or 30 Hz would trip one constantly.
   is *not* first in a `SYNC_READ` ID list. The host always lists it first, so in
   practice that wait is zero.
 
-### What has and has not been verified
+### Historical verification (v11, before the FT6 payload change)
 
 The protocol is checked by a **23-case round-trip test built from the shipping
 `Src/ft_slave.c`** (compiled with `-Dstatic=` so the parser, the framer and the
@@ -465,7 +469,7 @@ All 23 pass in both places. What it covers:
   pass.
 * **`PING`**: answered unicast with a payload-free status packet; silent on the
   broadcast address and on someone else's ID.
-* **`READ`** of the identity header a scan uses: address 3 returns
+* **`READ`** of the identity header a scan uses (before the FT6 identity change): address 3 returns
   `11 C0` (model `0xC011` little-endian), address 5 returns ID 200 and baud
   code 0.
 * **The per-tick `SYNC_READ(56, 12)`** with this board first in the ID list,

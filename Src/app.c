@@ -19,6 +19,7 @@
 
 #include "board.h"
 #include "ft_slave.h"
+#include "ft_sample.h"
 #include "lsm6dsv16x.h"
 
 /** Poll period in milliseconds. */
@@ -180,18 +181,6 @@ static uint16_t heartbeat_level(uint32_t phase_ms)
     return 0u;
 }
 
-static void put_i16(uint8_t *dst, int16_t v)
-{
-    dst[0] = (uint8_t)((uint16_t)v & 0xFFu);
-    dst[1] = (uint8_t)((uint16_t)v >> 8);
-}
-
-static void put_u16(uint8_t *dst, uint16_t v)
-{
-    dst[0] = (uint8_t)(v & 0xFFu);
-    dst[1] = (uint8_t)(v >> 8);
-}
-
 void app_init(void)
 {
     led_init();
@@ -200,7 +189,7 @@ void app_init(void)
     s_imu_present = lsm6dsv16x_init();
 
     /* The bus comes up whatever the IMU did. A board that answers with a zero
-     * block and IMU_PRESENT clear is diagnosable from the host; one that stays
+     * block and NOT_READY set is diagnosable from the host; one that stays
      * silent looks the same as an unplugged connector. */
     ft_slave_init();
 
@@ -274,38 +263,8 @@ void app_task(void)
      * publish is what the sensor measured. git history has the correction if a
      * crooked board ever turns up again. */
     uint8_t block[FT_SENSOR_LEN];
-    put_i16(&block[0], s_sample.gyro[0]);
-    put_i16(&block[2], s_sample.gyro[1]);
-    put_i16(&block[4], s_sample.gyro[2]);
-    /* Left at zero until SFLP has written its table. The host reads all-zero
-     * here as "orientation unknown" and holds its last good quaternion, which
-     * is the only honest answer during the ~0.7 s the algorithm takes to
-     * settle - reporting identity would tell fall detection the robot is
-     * upright. */
-    put_u16(&block[6], s_sample.quat_valid ? s_sample.quat[0] : 0u);
-    put_u16(&block[8], s_sample.quat_valid ? s_sample.quat[1] : 0u);
-    put_u16(&block[10], s_sample.quat_valid ? s_sample.quat[2] : 0u);
-    put_i16(&block[12], s_sample.acc[0]);
-    put_i16(&block[14], s_sample.acc[1]);
-    put_i16(&block[16], s_sample.acc[2]);
-
-    /* The counter is what tells the host a block is genuinely new. duck-control
-     * already watches for a repeated 12-byte block and calls the orientation
-     * frozen; this makes the same fault unambiguous over the full 20. */
-    block[18] = s_counter++;
-
-    uint8_t status = FT_STATUS_IMU_PRESENT;
-    if (s_sample.quat_valid) {
-        status |= FT_STATUS_SFLP_READY;
-    }
-    if (s_sample.fifo_overrun) {
-        status |= FT_STATUS_FIFO_OVERRUN;
-        s_sample.fifo_overrun = false; /* sticky until reported, then cleared */
-    }
-    if (s_sample.bus_error) {
-        status |= FT_STATUS_SPI_ERROR;
-    }
-    block[19] = status;
+    ft_sample_encode(block, &s_sample, s_counter++);
+    s_sample.fifo_overrun = false; /* sticky until reported */
 
     ft_slave_publish(block);
 }

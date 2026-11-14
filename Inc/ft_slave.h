@@ -4,22 +4,22 @@
  *
  * The Radxa ZERO 3W never talks to the LSM6DSV16X. It opens the servo bus
  * (/dev/ttyS2, 1 Mbps) and issues one SYNC_READ per control tick covering
- * this board and all fifteen HD1910 servos, at address 56 - the same address an
+ * this board and all fifteen HD1910 servos, at address 56, length 15 - the same start address an
  * HD1910 serves present_position / present_speed / present_load / voltage /
  * temperature from, which is why the whole thing fits in one transaction.
  *
  * This board is listed first in that ID list, so it answers before the servo
  * burst.
  *
- * The block served at 56 is 20 bytes; the tick consumes the first 12.
+ * The block served at 56 is the 15-byte Microduck FT6 payload.
  *
  * | offset | bytes | contents                                              |
  * |--------|-------|-------------------------------------------------------|
  * | 0      | 6     | gyro x/y/z, i16 LE raw counts, +/-500 dps             |
  * | 6      | 6     | SFLP game rotation vector x/y/z, IEEE binary16 LE     |
- * | 12     | 6     | accelerometer x/y/z, i16 LE raw counts, +/-4 g        |
- * | 18     | 1     | sample counter, wraps at 256                          |
- * | 19     | 1     | status flags, see FT_STATUS_*                         |
+ * | 12     | 1     | sample counter, wraps at 256                          |
+ * | 13     | 1     | fault flags, zero when healthy                        |
+ * | 14     | 1     | reserved, always zero                                 |
  *
  * w of the quaternion is not sent: the host reconstructs it as
  * sqrt(1 - x^2 - y^2 - z^2), and reads an all-zero x/y/z as "SFLP has not
@@ -46,7 +46,7 @@
  * | 7    | 1     | return delay (0)                                        |
  * | 8    | 1     | response status level (1 = answer every instruction)    |
  * | 16   | 22    | diagnostic counters, 11 x u16 LE - see ft_slave.c       |
- * | 56   | 20    | the sensor block above                                  |
+ * | 56   | 15    | the sensor block above                                  |
  *
  * Gaps read as zero, as does anything past the end of the table: a read is
  * always answered with exactly the number of bytes it asked for, so a host
@@ -87,37 +87,32 @@
  * Model, served at address 3 as u16 LE - where a Feetech device keeps its
  * servo major/minor version and where `servocom`'s scanner looks.
  *
- * 0xC011 is far outside the range any real Feetech servo reports (the highest
- * registered is the SM40BL at 10248), so it cannot be mistaken for one. It is
- * also what this board reported as its Dynamixel model number, which keeps a
- * board identifiable across the protocol change.
+ * FT6 compatibility identity expected by the Microduck host. Together with
+ * version 6.0 and END = 0, addresses 0..4 return 06 00 00 00 F2.
  */
-#define FT_MODEL_NUMBER 0xC011u
+#define FT_MODEL_NUMBER 0xF200u
 
-/** Bumped when the layout of the block at 56, or the meaning of its status
- *  byte, changes. 11 dropped the mounting correction of v7: samples are now
- *  published exactly as the sensor measured them, and FT_STATUS_MOUNT_CORR
- *  (0x10) is gone rather than merely always clear. */
-#define FT_FIRMWARE_VERSION 11u
+/** Reported FT6 compatibility version. This identifies the device to the
+ *  host; the sensor block uses FT6 56/15 with raw gyro/quaternion samples. */
+#define FT_FIRMWARE_VERSION 6u
 #define FT_FIRMWARE_MINOR   0u
 
 /** Start and length of the sensor block. */
 #define FT_SENSOR_ADDR 56u
-#define FT_SENSOR_LEN  20u
+#define FT_SENSOR_LEN  15u
+#define FT_COUNTER_OFFSET  12u
+#define FT_STATUS_OFFSET   13u
+#define FT_RESERVED_OFFSET 14u
 
 /** Size of the flat register file the slave serves. */
 #define FT_TABLE_SIZE (FT_SENSOR_ADDR + FT_SENSOR_LEN)
 
-/* Status flags, byte 19 of the sensor block. */
-#define FT_STATUS_IMU_PRESENT  0x01u /* WHO_AM_I matched at boot            */
-#define FT_STATUS_SFLP_READY   0x02u /* at least one quaternion has arrived */
-#define FT_STATUS_FIFO_OVERRUN 0x04u /* FIFO overran since the last publish */
-#define FT_STATUS_SPI_ERROR    0x08u /* an SPI transfer timed out           */
-/* 0x10 was MOUNT_CORR up to v10, when every sample was rotated by a fixed
- * per-robot mounting trim before publication. The board is mounted straight
- * and nothing is applied now, so the flag is retired rather than hard-wired
- * clear - do not reuse the bit for something else, or a host that still knows
- * the old meaning will read it as a correction being applied. */
+/* FT6 fault bits at offset 13. The runtime requires bits 0..2 clear for
+ * valid data and rejects bits 4..7. These assignments describe this firmware's
+ * fault causes; the installed runtime treats them collectively as invalid. */
+#define FT_STATUS_NOT_READY    0x01u /* no SFLP quaternion yet             */
+#define FT_STATUS_FIFO_OVERRUN 0x02u /* FIFO overran since the last publish */
+#define FT_STATUS_SPI_ERROR    0x04u /* an SPI transfer timed out           */
 
 /**
  * Report a dead IMU in the FT-SCS error byte as well as in the status flags.
@@ -129,7 +124,7 @@
  * FT-SCS can make about an IMU that is not answering either.
  *
  * Set to 0 for a board that must never look faulted to generic tooling. The
- * authoritative answer is byte 19 of the sensor block either way; this only
+ * authoritative answer is byte 13 of the sensor block either way; this only
  * decides whether the same fact also reaches a host that is not looking for
  * it.
  */
